@@ -119,12 +119,14 @@ class AvailabilityStore:
             CREATE TABLE IF NOT EXISTS injury_snapshots (id TEXT PRIMARY KEY, source TEXT NOT NULL, url TEXT NOT NULL, content_hash TEXT NOT NULL, raw_path TEXT NOT NULL, retrieved_at TEXT NOT NULL, parser_version TEXT NOT NULL, records TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS injury_imports (id INTEGER PRIMARY KEY, attempted_at TEXT NOT NULL, source TEXT NOT NULL, snapshot_id TEXT REFERENCES injury_snapshots(id), error TEXT);
             CREATE TABLE IF NOT EXISTS qb_profiles (id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_manifest TEXT NOT NULL, profiles TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS wr_profiles (id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_manifest TEXT NOT NULL, profiles TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS qb_overrides (id INTEGER PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, player_id TEXT, player_name TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(game_id,team));
             CREATE TABLE IF NOT EXISTS availability_assessments (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, snapshot_id TEXT REFERENCES injury_snapshots(id), base_qb TEXT, expected_qb TEXT, replacement_qb TEXT, absence_weight REAL NOT NULL, adjustment REAL NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS injury_predictions (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, model_id TEXT NOT NULL, created_at TEXT NOT NULL, kickoff TEXT NOT NULL, base_margin REAL NOT NULL, adjusted_margin REAL NOT NULL, assessments TEXT NOT NULL, detail TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS availability_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS injury_checks (id INTEGER PRIMARY KEY, game_id TEXT NOT NULL, due_at TEXT NOT NULL, kind TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'planned', task_name TEXT, UNIQUE(game_id,due_at));
             CREATE TABLE IF NOT EXISTS availability_changes (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, detected_at TEXT NOT NULL, before_detail TEXT, after_detail TEXT NOT NULL, material INTEGER NOT NULL, notified_at TEXT);
+            CREATE TABLE IF NOT EXISTS wr_assessments (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, snapshot_id TEXT, adjustment REAL NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(injury_checks)")}
             if "completed_at" not in columns:
@@ -167,6 +169,17 @@ class AvailabilityStore:
     def latest_profile(self):
         with self.store.connection() as db: row=db.execute("SELECT * FROM qb_profiles ORDER BY generated_at DESC LIMIT 1").fetchone()
         return dict(row) if row else None
+    def save_wr_profile(self, manifest, profiles, now):
+        pid = identity({"manifest": manifest, "version": "wr-performance-v1"})
+        with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO wr_profiles VALUES (?,?,?,?)", (pid, now.isoformat(), canonical(manifest), canonical(profiles)))
+        return pid
+    def latest_wr_profile(self):
+        with self.store.connection() as db: row = db.execute("SELECT * FROM wr_profiles ORDER BY generated_at DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+    def save_wr_assessment(self, detail, now):
+        aid = identity({"game": detail["game_id"], "team": detail["team"], "snapshot": detail.get("snapshot_id"), "players": detail["players"], "adjustment": detail["adjustment"]})
+        with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO wr_assessments VALUES (?,?,?,?,?,?,?)", (aid, detail["game_id"], detail["team"], detail.get("snapshot_id"), detail["adjustment"], canonical(detail), now.isoformat()))
+        return aid
     def save_assessment(self, assessment, now):
         aid=identity({k:assessment[k] for k in ("game_id","team","snapshot_id","base_qb","expected_qb","replacement_qb","absence_weight","adjustment")})
         with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO availability_assessments VALUES (?,?,?,?,?,?,?,?,?,?,?)",(aid,assessment["game_id"],assessment["team"],assessment.get("snapshot_id"),assessment.get("base_qb"),assessment.get("expected_qb"),assessment.get("replacement_qb"),assessment["absence_weight"],assessment["adjustment"],canonical(assessment),now.isoformat()))
@@ -304,6 +317,63 @@ def build_qb_profiles(store, *, now=None):
     return {"profile_id": profile_id, "players": len(profiles), "league_epa_per_dropback": league_epa}
 
 
+def build_wr_profiles(store, *, now=None):
+    """Build rolling receiver profiles from completed receiving production."""
+    now = now or utcnow(); cutoff = now.date().isoformat()
+    snapshots = list(ResearchStore(store).latest_stats().values())
+    game_dates = {g.game_id: g.gameday for g in store.games()}
+    by_player, manifest = defaultdict(list), []
+    columns = ["game_id", "posteam", "receiver_player_id", "receiver_player_name", "receiving_yards", "epa"]
+    for snapshot in snapshots:
+        raw = Path(snapshot["raw_path"])
+        if not raw.exists(): continue
+        try:
+            frame = pq.read_table(raw, columns=columns).to_pandas()
+        except (OSError, ValueError, KeyError):
+            continue
+        manifest.append(snapshot["id"])
+        frame = frame[frame["receiver_player_id"].notna() & frame["epa"].notna()]
+        for (game_id, team, player_id, name), group in frame.groupby(["game_id", "posteam", "receiver_player_id", "receiver_player_name"], dropna=True):
+            date = game_dates.get(game_id, "")
+            if date and date >= cutoff: continue
+            code = ALIASES.get(str(team), str(team))
+            if code not in TEAMS: continue
+            by_player[str(player_id)].append({"game_id": str(game_id), "date": date, "team": TEAMS[code], "player_id": str(player_id), "name": str(name), "receptions": int(len(group)), "yards": float(group["receiving_yards"].fillna(0).sum()), "epa": float(group["epa"].sum())})
+    profiles = []
+    for player_id, games in by_player.items():
+        games.sort(key=lambda row: (row["date"], row["game_id"])); recent = games[-16:]
+        receptions = sum(row["receptions"] for row in recent)
+        if receptions < 12: continue
+        last = recent[-1]; epa = sum(row["epa"] for row in recent)
+        profiles.append({"player_id": player_id, "name": last["name"], "team": last["team"], "prior_games": len(recent), "receptions": receptions, "yards": round(sum(row["yards"] for row in recent), 1), "epa_per_reception": round(epa / receptions, 4), "epa_per_game": round(epa / len(recent), 3), "last_game_date": last["date"], "last_game_receptions": last["receptions"]})
+    profiles.sort(key=lambda row: (row["team"], -row["epa_per_game"], row["name"]))
+    db = AvailabilityStore(store); profile_id = db.save_wr_profile({"stat_snapshots": manifest, "cutoff": cutoff}, profiles, now)
+    return {"profile_id": profile_id, "players": len(profiles)}
+
+
+def assess_wide_receivers(store, game, *, profile_row=None, snapshot=None, now=None):
+    """Assess reported wide receiver absences; this is distinct from the QB layer."""
+    now = now or utcnow(); db = AvailabilityStore(store)
+    profile_row = profile_row or db.latest_wr_profile()
+    profiles = json.loads(profile_row["profiles"]) if profile_row else []
+    raw = snapshot["records"] if snapshot else []
+    records = json.loads(raw) if isinstance(raw, str) else raw
+    team = game["team"]; available = [p for p in profiles if p["team"] == team]
+    details, total = [], 0.0
+    for record in records:
+        if record.get("team") != team or str(record.get("position", "")).upper() != "WR": continue
+        player, confidence = _resolve_player(record.get("player_name"), team, available)
+        if not player or not weight(record): continue
+        replacement = max((p for p in available if p["player_id"] != player["player_id"]), key=lambda p: p["epa_per_game"], default=None)
+        gap = max(0.0, player["epa_per_game"] - (replacement["epa_per_game"] if replacement else 0.0))
+        impact = -min(2.0, weight(record) * gap * .22)
+        total += impact
+        details.append({"player_id": player["player_id"], "player_name": player["name"], "absence_weight": weight(record), "replacement": replacement and replacement["name"], "adjustment": round(impact, 2), "match_confidence": confidence, "status": record.get("game_status") or record.get("practice_status")})
+    detail = {"game_id": game["game_id"], "team": team, "snapshot_id": snapshot and snapshot.get("id"), "players": details, "adjustment": round(max(-3.0, total), 2), "reason": "Official WR availability adjustment" if details else "No reported matched WR availability issue"}
+    db.save_wr_assessment(detail, now)
+    return detail
+
+
 def _resolve_player(name, team, profiles):
     candidates = [p for p in profiles if p["team"] == team]
     target = normalize_name(name or "")
@@ -375,9 +445,11 @@ def injury_adjusted_predictions(store, base_predictions, *, now=None):
             continue
         home = assess_availability(store, {"game_id": row["game_id"], "team": row["home_team"]}, profile_row=profile, snapshot=snapshot, now=now)
         away = assess_availability(store, {"game_id": row["game_id"], "team": row["away_team"]}, profile_row=profile, snapshot=snapshot, now=now)
-        adjusted = round(float(row["predicted_margin"]) + home["adjustment"] - away["adjustment"], 2)
-        item = {"game_id":row["game_id"], "model_id":row.get("model_id", "baseline"), "created_at":now.isoformat(), "kickoff":row.get("gameday"), "base_margin":row["predicted_margin"], "adjusted_margin":adjusted, "assessments":[home,away]}
-        db.save_prediction(item); results.append({**row, "injury_adjusted_margin": adjusted, "availability_assessments": [home, away], "availability_changes": [change for change in (home.get("change"), away.get("change")) if change]})
+        home_wr = assess_wide_receivers(store, {"game_id": row["game_id"], "team": row["home_team"]}, snapshot=snapshot, now=now)
+        away_wr = assess_wide_receivers(store, {"game_id": row["game_id"], "team": row["away_team"]}, snapshot=snapshot, now=now)
+        adjusted = round(float(row["predicted_margin"]) + home["adjustment"] - away["adjustment"] + home_wr["adjustment"] - away_wr["adjustment"], 2)
+        item = {"game_id":row["game_id"], "model_id":row.get("model_id", "baseline"), "created_at":now.isoformat(), "kickoff":row.get("gameday"), "base_margin":row["predicted_margin"], "adjusted_margin":adjusted, "assessments":[home,away,home_wr,away_wr]}
+        db.save_prediction(item); results.append({**row, "injury_adjusted_margin": adjusted, "availability_assessments": [home, away], "wr_assessments": [home_wr, away_wr], "availability_changes": [change for change in (home.get("change"), away.get("change")) if change]})
     return results
 
 

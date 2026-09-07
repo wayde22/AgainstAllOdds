@@ -262,6 +262,7 @@ can trigger the optional Windows toast notification.
 ```powershell
 python main.py sync-injuries
 python main.py build-qb-profiles
+python main.py build-wr-profiles
 python main.py predict-with-availability --model ridge-v1
 python main.py set-expected-qb --game-id 2026_01_NE_SEA --team "Seattle Seahawks" --player "Expected Quarterback" --reason "Confirmed starter"
 python main.py enable-windows-injury-checks
@@ -273,11 +274,14 @@ expected starter-versus-replacement difference in shrinkage-adjusted EPA per
 dropback, expected dropbacks, and a conservative 0.65 multiplier, capped at
 seven points. `set-expected-qb` saves a named override and its reason. Check
 windows are 7 days, 72 hours, 24 hours, 2 hours, 85 minutes, and 15 minutes
-before kickoff. The dashboard can keep that plan locally, or the explicitly
+before kickoff. Wide receiver availability is also included as a separate,
+conservative prospective adjustment based on rolling receiving EPA per game and
+the best available receiving replacement; it is capped at three points per
+team. The dashboard can keep that plan locally, or the explicitly
 enabled Windows runner can execute due checks every 15 minutes.
 
 Experiments and their fitted models are immutable. Changed historical statistics
 require an explicit new experiment; failed downloads or training retain the
 previous usable data and models. Complete database and raw-file backups preserve
-provenance. College football, live odds, non-QB player adjustments,
+provenance. College football, live odds, additional non-QB position groups,
 opponent-adjusted ratings, individual team scores, and automatic promotion remain future work.

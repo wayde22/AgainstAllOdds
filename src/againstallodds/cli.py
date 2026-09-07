@@ -89,6 +89,7 @@ def build_parser() -> argparse.ArgumentParser:
     injuries = subparsers.add_parser("sync-injuries", help="Save the current official NFL injury or inactive report.")
     injuries.add_argument("--source", choices=["injuries", "inactives"], default="injuries")
     subparsers.add_parser("build-qb-profiles", help="Build rolling quarterback performance profiles from retained play data.")
+    subparsers.add_parser("build-wr-profiles", help="Build rolling wide receiver performance profiles from retained play data.")
     injury_predictions = subparsers.add_parser("predict-with-availability", help="Save prospective forecasts with the current QB availability adjustment.")
     injury_predictions.add_argument("--model", choices=["power-rating-v1", "ridge-v1", "boosted-v1", "all"], default="all")
     override = subparsers.add_parser("set-expected-qb", help="Set a reviewable expected-QB override for one game.")
@@ -137,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dashboard":
             app = Path(__file__).with_name("dashboard.py")
             return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.address", "127.0.0.1", "--browser.gatherUsageStats", "false", "--", "--data-dir", str(args.data_dir.resolve())])
-        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-injuries", "build-qb-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
+        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-injuries", "build-qb-profiles", "build-wr-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
             from againstallodds.analytics_store import AnalyticsStore
             from againstallodds.analytics import backtest, sync_nfl, upcoming
             analytics_store = AnalyticsStore(args.data_dir)
@@ -153,6 +154,9 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "build-qb-profiles":
                 from againstallodds.injuries import build_qb_profiles
                 result = build_qb_profiles(analytics_store)
+            elif args.command == "build-wr-profiles":
+                from againstallodds.injuries import build_wr_profiles
+                result = build_wr_profiles(analytics_store)
             elif args.command == "set-expected-qb":
                 from againstallodds.injuries import AvailabilityStore
                 from againstallodds.nfl_data import TEAMS, utcnow

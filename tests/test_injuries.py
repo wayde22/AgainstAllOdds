@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from againstallodds.analytics_store import AnalyticsStore
 from againstallodds import injuries
-from againstallodds.injuries import AvailabilityStore, assess_availability, current_report, notify_windows, parse_official, report_freshness
+from againstallodds.injuries import AvailabilityStore, assess_availability, assess_wide_receivers, current_report, notify_windows, parse_official, report_freshness
 
 
 NOW = datetime(2026, 9, 7, 12, tzinfo=timezone.utc)
@@ -74,3 +74,18 @@ def test_manual_override_requires_a_real_profile_and_windows_toast_is_mockable(t
     monkeypatch.setattr(injuries.subprocess, "run", lambda *args, **kwargs: calls.append(args) or None)
     assert notify_windows("Availability", "Detroit Lions changed")
     assert calls and calls[0][0][0] == "powershell"
+
+
+def test_wide_receiver_assessment_uses_matched_official_status(tmp_path):
+    store = AnalyticsStore(tmp_path)
+    availability = AvailabilityStore(store)
+    profiles = [
+        {"player_id": "wr-one", "name": "WR One", "team": "Detroit Lions", "epa_per_game": 2.8},
+        {"player_id": "wr-two", "name": "WR Two", "team": "Detroit Lions", "epa_per_game": 0.7},
+    ]
+    availability.save_wr_profile({"fixture": "wr"}, profiles, NOW)
+    report = {"id": "fixture", "records": [{"player_name": "WR One", "team": "Detroit Lions", "position": "WR", "game_status": "Out", "practice_status": "", "source": "injuries"}]}
+    result = assess_wide_receivers(store, {"game_id": "fixture", "team": "Detroit Lions"}, snapshot=report, now=NOW)
+    assert result["players"][0]["player_name"] == "WR One"
+    assert result["players"][0]["replacement"] == "WR Two"
+    assert result["adjustment"] < 0

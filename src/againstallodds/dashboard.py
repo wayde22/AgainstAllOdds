@@ -79,12 +79,12 @@ def main():
         comparison_view(store)
         return
     if view == "Availability":
-        from againstallodds.injuries import AvailabilityStore, build_qb_profiles, sync_injuries, injury_adjusted_predictions, plan_injury_checks, current_report, report_freshness
+        from againstallodds.injuries import AvailabilityStore, build_qb_profiles, build_wr_profiles, sync_injuries, injury_adjusted_predictions, plan_injury_checks, current_report, report_freshness
         from againstallodds.experiments import predict_models
         availability = AvailabilityStore(store)
         st.subheader("Quarterback availability")
         st.caption("Official NFL reports are saved as immutable snapshots. The adjustment applies only to prospective forecasts and is separate from historical model scores.")
-        left, middle, right = st.columns(3)
+        left, middle, right, receiver = st.columns(4)
         if left.button("Sync official injury report", width="stretch"):
             try:
                 st.success(f"Saved {sync_injuries(store)['records']} report rows.")
@@ -100,8 +100,14 @@ def main():
                 st.success(f"Built {build_qb_profiles(store)['players']} rolling QB profiles.")
             except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
                 st.error(f"Profile build failed: {error}")
+        if receiver.button("Build WR profiles", width="stretch"):
+            try:
+                st.success(f"Built {build_wr_profiles(store)['players']} rolling WR profiles.")
+            except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
+                st.error(f"WR profile build failed: {error}")
         report = current_report(store)
         profile = availability.latest_profile()
+        wr_profile = availability.latest_wr_profile()
         check_mode = st.radio("Scheduled-check mode", ["dashboard", "windows"], horizontal=True, help="Dashboard records check windows for this app. Windows records the same plan for a future background runner; it does not create an operating-system task until that runner is enabled.")
         toasts = st.checkbox("Send Windows toast alerts for material QB changes", value=availability.setting("windows_toasts", True))
         availability.set_setting("windows_toasts", toasts)
@@ -116,7 +122,7 @@ def main():
                 st.error(f"Windows scheduler setup failed: {error}")
         freshness = report_freshness(report)
         status, alerts = st.columns([1, 1])
-        status.write({"latest_official_snapshot": report.get("retrieved_at"), "report_age_hours": freshness["age_hours"], "latest_qb_profile": profile and profile["generated_at"]})
+        status.write({"latest_official_snapshot": report.get("retrieved_at"), "report_age_hours": freshness["age_hours"], "latest_qb_profile": profile and profile["generated_at"], "latest_WR_profile": wr_profile and wr_profile["generated_at"]})
         if not freshness["fresh"]:
             status.warning("Official availability data is stale or unavailable. Sync it before relying on an adjustment.")
         changes = availability.changes()
@@ -154,11 +160,15 @@ def main():
                         st.success("Expected-QB override cleared.")
             st.subheader("QB performance inputs")
             st.dataframe(pd.DataFrame(profiles), hide_index=True, width="stretch")
+            if wr_profile:
+                st.subheader("WR performance inputs")
+                st.caption("WR adjustments use rolling receiving EPA per game, matched official status, and a conservative replacement gap. They are prospective-only and capped at three points per team.")
+                st.dataframe(pd.DataFrame(json.loads(wr_profile["profiles"])), hide_index=True, width="stretch")
             model = st.selectbox("Base projection model", ["power-rating-v1", "ridge-v1", "boosted-v1"], key="availability-model")
             if st.button("Calculate upcoming availability-adjusted forecasts", type="primary"):
                 try:
                     rows = injury_adjusted_predictions(store, predict_models(store, model=model))
-                    shown = [{"game_id": r["game_id"], "away": r["away_team"], "home": r["home_team"], "base_margin": r["predicted_margin"], "adjusted_margin": r["injury_adjusted_margin"], "home_expected_QB": r["availability_assessments"][0]["expected_qb_name"], "home_reason": r["availability_assessments"][0]["reason"], "away_expected_QB": r["availability_assessments"][1]["expected_qb_name"], "away_reason": r["availability_assessments"][1]["reason"]} for r in rows if r.get("predicted_margin") is not None]
+                    shown = [{"game_id": r["game_id"], "away": r["away_team"], "home": r["home_team"], "base_margin": r["predicted_margin"], "adjusted_margin": r["injury_adjusted_margin"], "home_expected_QB": r["availability_assessments"][0]["expected_qb_name"], "home_WR_adjustment": r["wr_assessments"][0]["adjustment"], "home_reason": r["availability_assessments"][0]["reason"], "away_expected_QB": r["availability_assessments"][1]["expected_qb_name"], "away_WR_adjustment": r["wr_assessments"][1]["adjustment"], "away_reason": r["availability_assessments"][1]["reason"]} for r in rows if r.get("predicted_margin") is not None]
                     st.dataframe(pd.DataFrame(shown), hide_index=True, width="stretch")
                 except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
                     st.error(f"Availability forecast failed: {error}")
