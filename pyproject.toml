@@ -1,9 +1,9 @@
 [project]
 name = "againstallodds"
-version = "0.1.0"
-description = "Educational NFL power ratings and projected lines."
+version = "0.3.0"
+description = "Local NFL statistics, power ratings, and chronological model comparison."
 requires-python = ">=3.14"
-dependencies = []
+dependencies = ["streamlit>=1.50,<2", "tzdata>=2025.1", "scikit-learn>=1.8,<2", "pyarrow>=18,<26", "pandas>=2.2,<4", "numpy>=2,<3", "threadpoolctl>=3,<4"]
 
 [project.optional-dependencies]
 dev = [
@@ -13,3 +13,4 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = "--basetemp=.pytest-tmp"

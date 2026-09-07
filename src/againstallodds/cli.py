@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import json
+import sqlite3
+import subprocess
 from pathlib import Path
 
 from againstallodds.exceptions import AgainstAllOddsError
@@ -33,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--data-dir",
         default="data",
         type=Path,
-        help="Folder used for ratings and game history JSON files.",
+        help="Folder for manual JSON experiments, NFL analytics, and model data.",
     )
     parser.add_argument(
         "--verbose",
@@ -72,6 +75,31 @@ def build_parser() -> argparse.ArgumentParser:
     history = subparsers.add_parser("history", help="Show recorded games.")
     history.add_argument("--limit", type=int, help="Show only the most recent N games.")
 
+    sync = subparsers.add_parser("sync-nfl", help="Download and retain real NFL data.")
+    sync.add_argument("--start-season", type=int, default=2015)
+    sync.add_argument("--end-season", type=int, default=2026)
+    subparsers.add_parser("backtest", help="Evaluate the imported NFL baseline.")
+    predictions = subparsers.add_parser("predict-week", help="Save predictions for the next seven days.")
+    predictions.add_argument("--model", choices=["power-rating-v1", "ridge-v1", "boosted-v1", "all"], default="power-rating-v1")
+    stats = subparsers.add_parser("sync-stats", help="Import seasonal play-by-play statistics.")
+    stats.add_argument("--start-season", type=int, default=2015)
+    stats.add_argument("--end-season", type=int, default=2026)
+    stats.add_argument("--refresh-history", action="store_true")
+    subparsers.add_parser("compare-models", help="Run the frozen three-model experiment.")
+    injuries = subparsers.add_parser("sync-injuries", help="Save the current official NFL injury or inactive report.")
+    injuries.add_argument("--source", choices=["injuries", "inactives"], default="injuries")
+    subparsers.add_parser("build-qb-profiles", help="Build rolling quarterback performance profiles from retained play data.")
+    injury_predictions = subparsers.add_parser("predict-with-availability", help="Save prospective forecasts with the current QB availability adjustment.")
+    injury_predictions.add_argument("--model", choices=["power-rating-v1", "ridge-v1", "boosted-v1", "all"], default="all")
+    override = subparsers.add_parser("set-expected-qb", help="Set a reviewable expected-QB override for one game.")
+    override.add_argument("--game-id", required=True)
+    override.add_argument("--team", required=True)
+    override.add_argument("--player", required=True)
+    override.add_argument("--reason", default="")
+    subparsers.add_parser("run-due-injury-checks", help="Run planned official-report checks that are due now.")
+    subparsers.add_parser("enable-windows-injury-checks", help="Register the opt-in Windows background injury checker.")
+    subparsers.add_parser("dashboard", help="Open the local NFL analytics dashboard.")
+
     return parser
 
 
@@ -106,6 +134,59 @@ def main(argv: list[str] | None = None) -> int:
     store = JsonStore(args.data_dir)
 
     try:
+        if args.command == "dashboard":
+            app = Path(__file__).with_name("dashboard.py")
+            return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.address", "127.0.0.1", "--browser.gatherUsageStats", "false", "--", "--data-dir", str(args.data_dir.resolve())])
+        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-injuries", "build-qb-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
+            from againstallodds.analytics_store import AnalyticsStore
+            from againstallodds.analytics import backtest, sync_nfl, upcoming
+            analytics_store = AnalyticsStore(args.data_dir)
+            if args.command == "run-due-injury-checks":
+                from againstallodds.injuries import run_due_injury_checks
+                result = run_due_injury_checks(analytics_store)
+            elif args.command == "enable-windows-injury-checks":
+                from againstallodds.injuries import register_windows_runner
+                result = register_windows_runner(args.data_dir)
+            elif args.command == "sync-injuries":
+                from againstallodds.injuries import sync_injuries
+                result = sync_injuries(analytics_store, source=args.source)
+            elif args.command == "build-qb-profiles":
+                from againstallodds.injuries import build_qb_profiles
+                result = build_qb_profiles(analytics_store)
+            elif args.command == "set-expected-qb":
+                from againstallodds.injuries import AvailabilityStore
+                from againstallodds.nfl_data import TEAMS, utcnow
+                availability = AvailabilityStore(analytics_store)
+                team = TEAMS.get(args.team.upper(), args.team)
+                availability.override(args.game_id, team, None, args.player, args.reason, utcnow())
+                result = {"game_id": args.game_id, "team": team, "expected_qb": args.player, "saved": True}
+            elif args.command == "predict-with-availability":
+                from againstallodds.experiments import predict_models
+                from againstallodds.injuries import injury_adjusted_predictions
+                result = injury_adjusted_predictions(analytics_store, predict_models(analytics_store, save=True, model=args.model))
+            elif args.command == "sync-stats":
+                from againstallodds.nfl_stats import sync_stats
+                result = sync_stats(analytics_store, args.start_season, args.end_season, refresh_history=args.refresh_history, progress=lambda message: print(message, file=sys.stderr, flush=True))
+                print(json.dumps(result, indent=2))
+                return 2 if any(r["status"] == "failed" for r in result) else 0
+            elif args.command == "compare-models":
+                from againstallodds.experiments import compare_models
+                result = compare_models(analytics_store, progress=lambda message: print(message, file=sys.stderr, flush=True))
+                result = {k: result[k] for k in ("experiment_id", "settings", "summary", "coverage")}
+            elif args.command == "sync-nfl":
+                result = sync_nfl(analytics_store, args.start_season, args.end_season)
+            elif args.command == "backtest":
+                result = backtest(analytics_store)["summary"]
+            else:
+                if not analytics_store.latest():
+                    raise AgainstAllOddsError("Import NFL data first with sync-nfl.")
+                if args.model == "power-rating-v1":
+                    result = upcoming(analytics_store, save=True)
+                else:
+                    from againstallodds.experiments import predict_models
+                    result = predict_models(analytics_store, save=True, model=args.model)
+            print(json.dumps(result, indent=2))
+            return 0
         if args.command == "initialize":
             return handle_initialize(store, force=args.force)
         if args.command == "ratings":
@@ -118,7 +199,7 @@ def main(argv: list[str] | None = None) -> int:
             return handle_record_game(store, args)
         if args.command == "history":
             return handle_history(store, limit=args.limit)
-    except AgainstAllOddsError as error:
+    except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
         LOGGER.error("%s", error)
         print(f"Error: {error}", file=sys.stderr)
         return 2
