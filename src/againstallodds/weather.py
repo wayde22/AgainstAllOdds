@@ -5,6 +5,7 @@ import math
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from datetime import timedelta
 from againstallodds.exceptions import AgainstAllOddsError
 from againstallodds.nfl_data import utcnow
 
@@ -18,6 +19,9 @@ def sync_weather(store, *, fetch=None, now=None):
     now=now or utcnow(); saved=[]
     for game in store.games():
         if game.complete or not game.kickoff or game.home_team not in VENUES: continue
+        kickoff = datetime.fromisoformat(game.kickoff.replace("Z", "+00:00"))
+        if kickoff > now + timedelta(days=7):
+            continue
         lat,lon,roof=VENUES[game.home_team]
         forecast={"venue":game.home_team,"roof":roof,"latitude":lat,"longitude":lon}
         if roof == "outdoor":

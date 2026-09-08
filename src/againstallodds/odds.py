@@ -158,10 +158,13 @@ def market_check_plan(store, *, now=None):
     for game in store.games():
         if game.complete or not game.kickoff: continue
         kickoff = _parse_time(game.kickoff)
+        if kickoff is None or kickoff > now + timedelta(days=7):
+            continue
         for hours, kind in ((72, "72h"), (66, "6h"), (60, "6h"), (54, "6h"), (48, "6h"), (42, "6h"), (36, "6h"), (30, "6h"), (24, "6h"), (18, "6h"), (12, "6h"), (6, "6h"), (3, "3h"), (2, "1h"), (1, "1h"), (.75, "15m"), (.5, "15m"), (.25, "15m")):
             due = kickoff - timedelta(hours=hours)
             if due > now: checks.append((game.game_id, due.isoformat(), kind))
-    store.save_market_checks(checks); return store.market_checks()
+    store.save_market_checks(checks)
+    return [{"game_id": game_id, "due_at": due_at, "kind": kind, "state": "planned"} for game_id, due_at, kind in checks]
 
 
 def normal_probability(margin, threshold=0., sigma=13.5):
