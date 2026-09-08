@@ -113,6 +113,25 @@ def test_same_day_missing_data_and_current_date():
     assert "missing statistics" in missing[-1]["exclusion"]
 
 
+def test_opponent_adjusted_feature_families_are_pregame_and_distinct():
+    games = [game(2015, n) for n in range(1, 7)]
+    stats = aggregate_games(games)
+    rolling = build_features(games, stats, "2026-01-01", family="rolling-adjusted")
+    srs = build_features(games, stats, "2026-01-01", family="srs")
+    assert "opponent_adjusted_off_epa_5" in rolling[-1]["features"]
+    assert "srs_margin" in srs[-1]["features"]
+    changed = [*games[:-1], replace(games[-1], home_score=100)]
+    assert build_features(changed, stats, "2026-01-01", family="rolling-adjusted")[-1]["features"] == rolling[-1]["features"]
+
+
+def test_feature_family_leaderboard_marks_untrained_families(tmp_path):
+    from againstallodds.research_ui import family_leaderboard
+    store = AnalyticsStore(tmp_path)
+    table = family_leaderboard(store)
+    assert {row["Feature family"] for row in table} == {"Raw rolling rates", "Rolling opponent-normalized", "Season-long SRS"}
+    assert {row["Status"] for row in table} == {"Not trained"}
+
+
 def test_rest_and_rate_pooling():
     games = [game(2015, n) for n in range(1, 4)]
     history = [(g, g.home_team) for g in games]

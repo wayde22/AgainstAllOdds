@@ -81,15 +81,22 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("backtest", help="Evaluate the imported NFL baseline.")
     predictions = subparsers.add_parser("predict-week", help="Save predictions for the next seven days.")
     predictions.add_argument("--model", choices=["power-rating-v1", "ridge-v1", "boosted-v1", "all"], default="power-rating-v1")
+    predictions.add_argument("--family", choices=["raw", "rolling-adjusted", "srs"], default="raw")
     stats = subparsers.add_parser("sync-stats", help="Import seasonal play-by-play statistics.")
     stats.add_argument("--start-season", type=int, default=2015)
     stats.add_argument("--end-season", type=int, default=2026)
     stats.add_argument("--refresh-history", action="store_true")
-    subparsers.add_parser("compare-models", help="Run the frozen three-model experiment.")
+    comparison = subparsers.add_parser("compare-models", help="Run a frozen three-model experiment.")
+    comparison.add_argument("--family", choices=["raw", "rolling-adjusted", "srs"], default="raw")
+    subparsers.add_parser("sync-odds", help="Fetch and retain current NFL market spreads from the configured provider.")
+    odds_import = subparsers.add_parser("import-odds", help="Import reviewed bookmaker spreads from a local CSV.")
+    odds_import.add_argument("--file", type=Path, required=True, help="CSV with home_team, away_team, bookmaker, and home_spread columns.")
     injuries = subparsers.add_parser("sync-injuries", help="Save the current official NFL injury or inactive report.")
     injuries.add_argument("--source", choices=["injuries", "inactives"], default="injuries")
     subparsers.add_parser("build-qb-profiles", help="Build rolling quarterback performance profiles from retained play data.")
     subparsers.add_parser("build-wr-profiles", help="Build rolling wide receiver performance profiles from retained play data.")
+    subparsers.add_parser("build-rb-te-profiles", help="Build role-based running back and tight end profiles from retained play data.")
+    subparsers.add_parser("build-edge-profiles", help="Build rolling EDGE/pass-rusher disruption profiles from retained play data.")
     injury_predictions = subparsers.add_parser("predict-with-availability", help="Save prospective forecasts with the current QB availability adjustment.")
     injury_predictions.add_argument("--model", choices=["power-rating-v1", "ridge-v1", "boosted-v1", "all"], default="all")
     override = subparsers.add_parser("set-expected-qb", help="Set a reviewable expected-QB override for one game.")
@@ -138,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dashboard":
             app = Path(__file__).with_name("dashboard.py")
             return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.address", "127.0.0.1", "--browser.gatherUsageStats", "false", "--", "--data-dir", str(args.data_dir.resolve())])
-        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-injuries", "build-qb-profiles", "build-wr-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
+        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-odds", "import-odds", "sync-injuries", "build-qb-profiles", "build-wr-profiles", "build-rb-te-profiles", "build-edge-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
             from againstallodds.analytics_store import AnalyticsStore
             from againstallodds.analytics import backtest, sync_nfl, upcoming
             analytics_store = AnalyticsStore(args.data_dir)
@@ -157,6 +164,12 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "build-wr-profiles":
                 from againstallodds.injuries import build_wr_profiles
                 result = build_wr_profiles(analytics_store)
+            elif args.command == "build-rb-te-profiles":
+                from againstallodds.injuries import build_rb_te_profiles
+                result = build_rb_te_profiles(analytics_store)
+            elif args.command == "build-edge-profiles":
+                from againstallodds.injuries import build_edge_profiles
+                result = build_edge_profiles(analytics_store)
             elif args.command == "set-expected-qb":
                 from againstallodds.injuries import AvailabilityStore
                 from againstallodds.nfl_data import TEAMS, utcnow
@@ -175,8 +188,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 2 if any(r["status"] == "failed" for r in result) else 0
             elif args.command == "compare-models":
                 from againstallodds.experiments import compare_models
-                result = compare_models(analytics_store, progress=lambda message: print(message, file=sys.stderr, flush=True))
+                result = compare_models(analytics_store, family=args.family, progress=lambda message: print(message, file=sys.stderr, flush=True))
                 result = {k: result[k] for k in ("experiment_id", "settings", "summary", "coverage")}
+            elif args.command == "sync-odds":
+                from againstallodds.odds import sync_odds
+                result = sync_odds(analytics_store)
+            elif args.command == "import-odds":
+                from againstallodds.odds import import_odds
+                result = import_odds(analytics_store, args.file.read_bytes())
             elif args.command == "sync-nfl":
                 result = sync_nfl(analytics_store, args.start_season, args.end_season)
             elif args.command == "backtest":
@@ -188,7 +207,7 @@ def main(argv: list[str] | None = None) -> int:
                     result = upcoming(analytics_store, save=True)
                 else:
                     from againstallodds.experiments import predict_models
-                    result = predict_models(analytics_store, save=True, model=args.model)
+                    result = predict_models(analytics_store, save=True, model=args.model, family=args.family)
             print(json.dumps(result, indent=2))
             return 0
         if args.command == "initialize":

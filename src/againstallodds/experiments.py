@@ -15,7 +15,7 @@ from threadpoolctl import threadpool_limits
 
 from againstallodds.analytics import metrics, upcoming
 from againstallodds.exceptions import AgainstAllOddsError
-from againstallodds.features import FEATURE_VERSION, feature_dataset
+from againstallodds.features import FEATURE_VERSION, FEATURE_FAMILIES, feature_dataset
 from againstallodds.nfl_data import utcnow
 from againstallodds.research_store import ResearchStore, identity
 
@@ -92,16 +92,18 @@ def summarize(rows):
     return summary
 
 
-def compare_models(store, *, progress=None, now=None):
+def compare_models(store, *, family="raw", progress=None, now=None):
+    if family not in FEATURE_FAMILIES:
+        raise AgainstAllOddsError(f"Unknown feature family: {family}")
     now = now or utcnow()
     research = ResearchStore(store)
     stats = research.latest_stats()
     missing = sorted(set(range(2015, 2026)) - set(stats))
     if missing:
         raise AgainstAllOddsError(f"Import historical statistics first. Missing seasons: {missing}")
-    fid, rows, manifest = feature_dataset(store, now)
+    fid, rows, manifest = feature_dataset(store, now, family=family)
     names = sorted(rows[0]["features"])
-    specification = {**SPEC, "sklearn": sklearn.__version__, "feature_names": names}
+    specification = {**SPEC, "sklearn": sklearn.__version__, "feature_family": family, "feature_names": names}
     eid = identity({"features": fid, "specification": specification})
     cached = research.experiment(eid)
     if cached:
@@ -165,7 +167,7 @@ def compare_models(store, *, progress=None, now=None):
     return result
 
 
-def predict_models(store, *, now=None, save=False, model="all"):
+def predict_models(store, *, now=None, save=False, model="all", family="raw"):
     now = now or utcnow()
     forecasts = upcoming(store, now, save=save and model in {"all", BASELINE})
     baseline_rows = [{**r, "model_id": BASELINE, "available": True} for r in forecasts]
@@ -173,12 +175,12 @@ def predict_models(store, *, now=None, save=False, model="all"):
         return baseline_rows
     output = baseline_rows if model == "all" else []
     research = ResearchStore(store)
-    experiment = research.latest_experiment()
+    experiment = research.experiment_for_family(family)
     if not experiment:
         for model_id in MODELS[1:] if model == "all" else [model]:
             output.extend({**r, "model_id": model_id, "predicted_margin": None, "available": False, "exclusion": "Run the model comparison to train this challenger."} for r in forecasts)
         return output
-    _, feature_rows, manifest = feature_dataset(store, now, persist=save)
+    _, feature_rows, manifest = feature_dataset(store, now, persist=save, family=family)
     features = {r["game_id"]: r for r in feature_rows}
     names = json.loads(experiment["specification"])["feature_names"]
     for season in sorted({r["season"] for r in forecasts}):
@@ -201,7 +203,7 @@ def predict_models(store, *, now=None, save=False, model="all"):
             with threadpool_limits(limits=2):
                 values = fitted.predict(matrix([r[1] for r in usable], names))
             for (row, feature), value in zip(usable, values, strict=True):
-                prediction = {**row, "predicted_margin": float(value), "model_id": model_id, "available": True, "artifact_id": artifact["id"], "feature_version": FEATURE_VERSION, "feature_manifest": manifest}
+                prediction = {**row, "predicted_margin": float(value), "model_id": model_id, "feature_family": family, "available": True, "artifact_id": artifact["id"], "feature_version": FEATURE_VERSION, "feature_manifest": manifest}
                 output.append(prediction)
                 saved.append(prediction)
             if save:

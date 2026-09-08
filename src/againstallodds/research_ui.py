@@ -10,11 +10,28 @@ import streamlit as st
 from againstallodds.analytics import forward_results, metrics
 from againstallodds.exceptions import AgainstAllOddsError
 from againstallodds.experiments import BASELINE, MODELS, compare_models, paired_interval, predict_models
-from againstallodds.features import feature_dataset
+from againstallodds.features import FEATURE_FAMILIES, feature_dataset
 from againstallodds.nfl_stats import sync_stats
 from againstallodds.research_store import ResearchStore
 
 LABELS = {BASELINE: "Power-rating baseline", "ridge-v1": "Ridge regression", "boosted-v1": "Gradient-boosted trees"}
+FAMILY_LABELS = {"raw": "Raw rolling rates", "rolling-adjusted": "Rolling opponent-normalized", "srs": "Season-long SRS"}
+
+
+def family_leaderboard(store, period="test"):
+    """Return comparable saved results for each explicitly trained feature family."""
+    research = ResearchStore(store)
+    table = []
+    for family in FEATURE_FAMILIES:
+        experiment = research.experiment_for_family(family)
+        if not experiment:
+            table.append({"Feature family": FAMILY_LABELS[family], "Status": "Not trained", "Model": "—", "Games": None, "Margin MAE": None})
+            continue
+        result = json.loads(experiment["result"])
+        for row in result["summary"]:
+            if row["stage"] == period and row["model_id"] != BASELINE:
+                table.append({"Feature family": FAMILY_LABELS[family], "Status": "Saved", "Model": LABELS[row["model_id"]], "Games": row["games"], "Margin MAE": row["margin_mae"], "Experiment": experiment["created_at"]})
+    return table
 
 
 def metric_table(rows):
@@ -32,6 +49,7 @@ def comparison_view(store):
     st.subheader("Model comparison")
     st.write("Train on earlier seasons, compare on later games, then follow forecasts saved before kickoff.")
     research = ResearchStore(store)
+    family = st.selectbox("Feature family", FEATURE_FAMILIES, format_func=FAMILY_LABELS.get)
     left, right = st.columns(2)
     with left:
         refresh_history = st.checkbox("Re-download historical statistics", value=False)
@@ -49,19 +67,22 @@ def comparison_view(store):
     if compare_clicked:
         with st.status("Running the chronological comparison…", expanded=True) as status:
             try:
-                compare_models(store, progress=st.write)
+                compare_models(store, family=family, progress=st.write)
                 status.update(label="Comparison saved", state="complete")
             except (AgainstAllOddsError, OSError, ValueError, sqlite3.Error) as error:
                 status.update(label="Comparison failed; previous results retained", state="error")
                 st.error(str(error))
     stats = research.latest_stats()
     st.caption(f"Statistics cached: {len(stats)} seasons. The initial import is larger than a schedule refresh; navigation never downloads or trains models.")
-    experiment = research.latest_experiment()
+    st.subheader("Feature-family leaderboard")
+    st.caption("Held-out 2024–2025 MAE is the comparison point. These results do not activate a forecast automatically.")
+    st.dataframe(pd.DataFrame(family_leaderboard(store)), hide_index=True, width="stretch", column_config={"Margin MAE": st.column_config.NumberColumn(format="%.3f")})
+    experiment = research.experiment_for_family(family)
     if not experiment:
         st.info("Import rich statistics, then run the model comparison. Existing baseline forecasts remain available.")
         return
     result = json.loads(experiment["result"])
-    st.caption(f"Saved experiment: {experiment['created_at']} · {experiment['id'][:12]} · The baseline remains the default model.")
+    st.caption(f"Saved {family} experiment: {experiment['created_at']} · {experiment['id'][:12]} · The baseline remains the default model.")
     manifest = result["manifest"]
     changed = any(manifest["statistics"].get(str(season)) != item["id"] for season, item in stats.items() if season <= 2025)
     if changed:
@@ -102,8 +123,8 @@ def comparison_view(store):
         st.json(result["validation"])
 
 
-def upcoming_comparison(store, format_line):
-    rows = predict_models(store)
+def upcoming_comparison(store, format_line, family="raw"):
+    rows = predict_models(store, family=family)
     if not rows:
         st.info("No eligible upcoming games within seven days.")
         return
@@ -112,7 +133,7 @@ def upcoming_comparison(store, format_line):
         item = table.setdefault(row["game_id"], {"Date": row["gameday"], "Away": row["away_team"], "Home": row["home_team"]})
         item[LABELS[row["model_id"]]] = format_line(row) if row["available"] else row["exclusion"]
     st.dataframe(pd.DataFrame(table.values()), hide_index=True, width="stretch")
-    st.caption("Challengers use frozen annual fits with updated pregame features. Estimates are saved on successful refreshes; simply viewing this table does not create predictions.")
+    st.caption(f"{family} challengers use frozen annual fits with updated pregame features. Estimates are saved on successful refreshes; simply viewing this table does not create predictions.")
 
 
 def rolling_history(store, team):

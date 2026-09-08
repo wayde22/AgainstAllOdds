@@ -3,6 +3,8 @@ __pycache__/
 
 .venv/
 .env
+.env.*
+!.env.example
 
 .pytest_cache/
 .pytest-tmp/
@@ -16,3 +18,8 @@ build/
 dist/
 
 data/
+*.sqlite3
+*.sqlite3-*
+market-lines*.csv
+!market-lines.example.csv
+*.log

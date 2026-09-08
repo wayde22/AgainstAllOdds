@@ -83,15 +83,19 @@ def upcoming(store, now=None, save=False):
     games = store.games(snapshot)
     today = now.astimezone(nfl_data.ZoneInfo("America/New_York")).date().isoformat()
     _, system, _ = replay(games, snapshot["start_season"], snapshot["end_season"], before=today)
+    from againstallodds.odds import consensus
+    market, market_snapshot = consensus(store, now=now)
     rows = []
     for g in games:
         if g.complete or not g.kickoff or not now < datetime.fromisoformat(g.kickoff) <= now + timedelta(days=7):
             continue
         margin = system.expected_margin(g.home_team, g.away_team, neutral_site=g.neutral_site)
         # Schedule reference lines are not verified point-in-time market observations.
-        rows.append({**g.to_dict(), "predicted_margin": margin, "market_margin": None, "edge": None})
+        line = market.get(g.game_id, {})
+        market_margin = line.get("market_margin")
+        rows.append({**g.to_dict(), "predicted_margin": margin, "market_margin": market_margin, "edge": None if market_margin is None else round(margin - market_margin, 2), **line})
     if save:
-        store.save_predictions(snapshot["id"], {**CONFIG, "start": snapshot["start_season"], "end": snapshot["end_season"], "before": today}, rows, now)
+        store.save_predictions(snapshot["id"], {**CONFIG, "start": snapshot["start_season"], "end": snapshot["end_season"], "before": today, "market_snapshot_id": market_snapshot and market_snapshot["id"]}, rows, now)
     return rows
 
 

@@ -16,6 +16,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 import numpy as np
+import pandas as pd
 import pyarrow.parquet as pq
 
 from againstallodds.exceptions import AgainstAllOddsError
@@ -120,6 +121,8 @@ class AvailabilityStore:
             CREATE TABLE IF NOT EXISTS injury_imports (id INTEGER PRIMARY KEY, attempted_at TEXT NOT NULL, source TEXT NOT NULL, snapshot_id TEXT REFERENCES injury_snapshots(id), error TEXT);
             CREATE TABLE IF NOT EXISTS qb_profiles (id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_manifest TEXT NOT NULL, profiles TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS wr_profiles (id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_manifest TEXT NOT NULL, profiles TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS rb_te_profiles (id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_manifest TEXT NOT NULL, profiles TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS edge_profiles (id TEXT PRIMARY KEY, generated_at TEXT NOT NULL, source_manifest TEXT NOT NULL, profiles TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS qb_overrides (id INTEGER PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, player_id TEXT, player_name TEXT NOT NULL, reason TEXT NOT NULL, created_at TEXT NOT NULL, UNIQUE(game_id,team));
             CREATE TABLE IF NOT EXISTS availability_assessments (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, snapshot_id TEXT REFERENCES injury_snapshots(id), base_qb TEXT, expected_qb TEXT, replacement_qb TEXT, absence_weight REAL NOT NULL, adjustment REAL NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS injury_predictions (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, model_id TEXT NOT NULL, created_at TEXT NOT NULL, kickoff TEXT NOT NULL, base_margin REAL NOT NULL, adjusted_margin REAL NOT NULL, assessments TEXT NOT NULL, detail TEXT NOT NULL);
@@ -127,6 +130,8 @@ class AvailabilityStore:
             CREATE TABLE IF NOT EXISTS injury_checks (id INTEGER PRIMARY KEY, game_id TEXT NOT NULL, due_at TEXT NOT NULL, kind TEXT NOT NULL, mode TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'planned', task_name TEXT, UNIQUE(game_id,due_at));
             CREATE TABLE IF NOT EXISTS availability_changes (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, detected_at TEXT NOT NULL, before_detail TEXT, after_detail TEXT NOT NULL, material INTEGER NOT NULL, notified_at TEXT);
             CREATE TABLE IF NOT EXISTS wr_assessments (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, snapshot_id TEXT, adjustment REAL NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS skill_assessments (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, position TEXT NOT NULL, snapshot_id TEXT, adjustment REAL NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS edge_assessments (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, team TEXT NOT NULL, snapshot_id TEXT, adjustment REAL NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(injury_checks)")}
             if "completed_at" not in columns:
@@ -176,9 +181,31 @@ class AvailabilityStore:
     def latest_wr_profile(self):
         with self.store.connection() as db: row = db.execute("SELECT * FROM wr_profiles ORDER BY generated_at DESC LIMIT 1").fetchone()
         return dict(row) if row else None
+    def save_rb_te_profile(self, manifest, profiles, now):
+        pid = identity({"manifest": manifest, "version": "rb-te-performance-v1"})
+        with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO rb_te_profiles VALUES (?,?,?,?)", (pid, now.isoformat(), canonical(manifest), canonical(profiles)))
+        return pid
+    def latest_rb_te_profile(self):
+        with self.store.connection() as db: row = db.execute("SELECT * FROM rb_te_profiles ORDER BY generated_at DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
+    def save_edge_profile(self, manifest, profiles, now):
+        pid = identity({"manifest": manifest, "version": "edge-disruption-v1"})
+        with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO edge_profiles VALUES (?,?,?,?)", (pid, now.isoformat(), canonical(manifest), canonical(profiles)))
+        return pid
+    def latest_edge_profile(self):
+        with self.store.connection() as db: row = db.execute("SELECT * FROM edge_profiles ORDER BY generated_at DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
     def save_wr_assessment(self, detail, now):
         aid = identity({"game": detail["game_id"], "team": detail["team"], "snapshot": detail.get("snapshot_id"), "players": detail["players"], "adjustment": detail["adjustment"]})
         with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO wr_assessments VALUES (?,?,?,?,?,?,?)", (aid, detail["game_id"], detail["team"], detail.get("snapshot_id"), detail["adjustment"], canonical(detail), now.isoformat()))
+        return aid
+    def save_skill_assessment(self, detail, now):
+        aid = identity({"game": detail["game_id"], "team": detail["team"], "position": detail["position"], "snapshot": detail.get("snapshot_id"), "players": detail["players"], "adjustment": detail["adjustment"]})
+        with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO skill_assessments VALUES (?,?,?,?,?,?,?,?)", (aid, detail["game_id"], detail["team"], detail["position"], detail.get("snapshot_id"), detail["adjustment"], canonical(detail), now.isoformat()))
+        return aid
+    def save_edge_assessment(self, detail, now):
+        aid = identity({"game": detail["game_id"], "team": detail["team"], "snapshot": detail.get("snapshot_id"), "players": detail["players"], "adjustment": detail["adjustment"]})
+        with self.store.connection() as db: db.execute("INSERT OR IGNORE INTO edge_assessments VALUES (?,?,?,?,?,?,?)", (aid, detail["game_id"], detail["team"], detail.get("snapshot_id"), detail["adjustment"], canonical(detail), now.isoformat()))
         return aid
     def save_assessment(self, assessment, now):
         aid=identity({k:assessment[k] for k in ("game_id","team","snapshot_id","base_qb","expected_qb","replacement_qb","absence_weight","adjustment")})
@@ -374,6 +401,125 @@ def assess_wide_receivers(store, game, *, profile_row=None, snapshot=None, now=N
     return detail
 
 
+def build_rb_te_profiles(store, *, now=None):
+    """Build role-based RB and TE profiles from completed rushing/receiving plays."""
+    now = now or utcnow(); cutoff = now.date().isoformat()
+    snapshots = list(ResearchStore(store).latest_stats().values())
+    game_dates = {g.game_id: g.gameday for g in store.games()}; by_player, manifest = defaultdict(list), []
+    columns = ["game_id", "posteam", "rusher_player_id", "rusher_player_name", "receiver_player_id", "receiver_player_name", "rush_attempt", "rushing_yards", "receiving_yards", "epa"]
+    for snapshot in snapshots:
+        raw = Path(snapshot["raw_path"])
+        if not raw.exists(): continue
+        try: frame = pq.read_table(raw, columns=columns).to_pandas()
+        except (OSError, ValueError, KeyError): continue
+        manifest.append(snapshot["id"])
+        frame = frame[frame["epa"].notna()].copy()
+        frame["date"] = frame["game_id"].map(game_dates).fillna("")
+        frame = frame[(frame["date"] == "") | (frame["date"] < cutoff)]
+        frame["code"] = frame["posteam"].astype(str).replace(ALIASES)
+        frame["team"] = frame["code"].map(TEAMS)
+        frame = frame[frame["team"].notna()]
+        keys = ["player_id", "name", "game_id", "date", "team"]
+        rush = frame[(frame["rush_attempt"] == 1) & frame["rusher_player_id"].notna()][["rusher_player_id", "rusher_player_name", "game_id", "date", "team", "rushing_yards", "epa"]].rename(columns={"rusher_player_id": "player_id", "rusher_player_name": "name", "rushing_yards": "yards"})
+        rush["rushes"], rush["receptions"] = 1, 0
+        receive = frame[frame["receiver_player_id"].notna()][["receiver_player_id", "receiver_player_name", "game_id", "date", "team", "receiving_yards", "epa"]].rename(columns={"receiver_player_id": "player_id", "receiver_player_name": "name", "receiving_yards": "yards"})
+        receive["rushes"], receive["receptions"] = 0, 1
+        combined = pd.concat([rush, receive], ignore_index=True)
+        for item in combined.groupby(keys, dropna=True, as_index=False).agg(rushes=("rushes", "sum"), receptions=("receptions", "sum"), yards=("yards", "sum"), epa=("epa", "sum")).to_dict("records"):
+            item["player_id"], item["game_id"] = str(item["player_id"]), str(item["game_id"])
+            by_player[item["player_id"]].append(item)
+    rb, te = [], []
+    for player_id, player_games in by_player.items():
+        player_games.sort(key=lambda row: (row["date"], row["game_id"])); recent = player_games[-16:]
+        last = recent[-1]; rushes = sum(row["rushes"] for row in recent); receptions = sum(row["receptions"] for row in recent); epa = sum(row["epa"] for row in recent)
+        shared = {"player_id": player_id, "name": last["name"], "team": last["team"], "prior_games": len(recent), "rushes": rushes, "receptions": receptions, "yards": round(sum(row["yards"] for row in recent), 1), "epa_per_game": round(epa / len(recent), 3), "last_game_date": last["date"]}
+        if rushes >= 15: rb.append({**shared, "role": "RB"})
+        if receptions >= 8: te.append({**shared, "role": "TE"})
+    rb.sort(key=lambda row: (row["team"], -row["epa_per_game"], row["name"])); te.sort(key=lambda row: (row["team"], -row["epa_per_game"], row["name"]))
+    db = AvailabilityStore(store); profile_id = db.save_rb_te_profile({"stat_snapshots": manifest, "cutoff": cutoff}, {"RB": rb, "TE": te}, now)
+    return {"profile_id": profile_id, "running_backs": len(rb), "tight_ends": len(te)}
+
+
+def assess_skill_position(store, game, position, *, profile_row=None, snapshot=None, now=None):
+    """Assess role-based RB or TE availability from the official position label."""
+    now = now or utcnow(); db = AvailabilityStore(store)
+    profile_row = profile_row or db.latest_rb_te_profile()
+    grouped = json.loads(profile_row["profiles"]) if profile_row else {}
+    profiles = grouped.get(position, []); team = game["team"]
+    raw = snapshot["records"] if snapshot else []; records = json.loads(raw) if isinstance(raw, str) else raw
+    unavailable = {p["player_id"] for record in records if record.get("team") == team and weight(record) > 0 for p, _ in [_resolve_player(record.get("player_name"), team, profiles)] if p}
+    details, total = [], 0.0
+    for record in records:
+        if record.get("team") != team or str(record.get("position", "")).upper() != position: continue
+        player, confidence = _resolve_player(record.get("player_name"), team, profiles)
+        if not player or not weight(record): continue
+        replacement = max((p for p in profiles if p["team"] == team and p["player_id"] not in unavailable and p["player_id"] != player["player_id"]), key=lambda p: p["epa_per_game"], default=None)
+        gap = max(0.0, player["epa_per_game"] - (replacement["epa_per_game"] if replacement else 0.0))
+        impact = -min(1.5, weight(record) * gap * (.20 if position == "RB" else .18)); total += impact
+        details.append({"player_id": player["player_id"], "player_name": player["name"], "absence_weight": weight(record), "replacement": replacement and replacement["name"], "adjustment": round(impact, 2), "match_confidence": confidence, "status": record.get("game_status") or record.get("practice_status")})
+    detail = {"game_id": game["game_id"], "team": team, "position": position, "snapshot_id": snapshot and snapshot.get("id"), "players": details, "adjustment": round(total, 2), "reason": f"Official {position} role-based availability adjustment" if details else f"No reported matched {position} availability issue"}
+    db.save_skill_assessment(detail, now); return detail
+
+
+EDGE_POSITIONS = {"DE", "OLB", "EDGE"}
+
+
+def build_edge_profiles(store, *, now=None):
+    """Build rolling pass-rush disruption profiles from sacks and QB hits."""
+    now = now or utcnow(); cutoff = now.date().isoformat()
+    snapshots = list(ResearchStore(store).latest_stats().values())
+    game_dates = {g.game_id: g.gameday for g in store.games()}; by_player, manifest = defaultdict(list), []
+    columns = ["game_id", "defteam", "sack_player_id", "sack_player_name", "qb_hit_1_player_id", "qb_hit_1_player_name", "qb_hit_2_player_id", "qb_hit_2_player_name"]
+    for snapshot in snapshots:
+        raw = Path(snapshot["raw_path"])
+        if not raw.exists(): continue
+        try: frame = pq.read_table(raw, columns=columns).to_pandas()
+        except (OSError, ValueError, KeyError): continue
+        manifest.append(snapshot["id"])
+        frame["date"] = frame["game_id"].map(game_dates).fillna("")
+        frame = frame[(frame["date"] == "") | (frame["date"] < cutoff)]
+        frame["code"] = frame["defteam"].astype(str).replace(ALIASES); frame["team"] = frame["code"].map(TEAMS)
+        frame = frame[frame["team"].notna()]
+        events = []
+        for identifier, name, kind in (("sack_player_id", "sack_player_name", "sack"), ("qb_hit_1_player_id", "qb_hit_1_player_name", "hit"), ("qb_hit_2_player_id", "qb_hit_2_player_name", "hit")):
+            event = frame[frame[identifier].notna()][[identifier, name, "game_id", "date", "team"]].rename(columns={identifier: "player_id", name: "name"})
+            event["sacks"], event["hits"] = (1, 0) if kind == "sack" else (0, 1)
+            events.append(event)
+        combined = pd.concat(events, ignore_index=True)
+        for item in combined.groupby(["player_id", "name", "game_id", "date", "team"], dropna=True, as_index=False).agg(sacks=("sacks", "sum"), hits=("hits", "sum")).to_dict("records"):
+            item["player_id"], item["game_id"] = str(item["player_id"]), str(item["game_id"]); by_player[item["player_id"]].append(item)
+    profiles = []
+    for player_id, games in by_player.items():
+        games.sort(key=lambda row: (row["date"], row["game_id"])); recent = games[-16:]
+        sacks, hits = sum(row["sacks"] for row in recent), sum(row["hits"] for row in recent)
+        if sacks + hits < 3: continue
+        last = recent[-1]
+        profiles.append({"player_id": player_id, "name": last["name"], "team": last["team"], "prior_games": len(recent), "sacks": sacks, "qb_hits": hits, "disruption_per_game": round((sacks + .25 * hits) / len(recent), 3), "last_game_date": last["date"]})
+    profiles.sort(key=lambda row: (row["team"], -row["disruption_per_game"], row["name"]))
+    db = AvailabilityStore(store); profile_id = db.save_edge_profile({"stat_snapshots": manifest, "cutoff": cutoff}, profiles, now)
+    return {"profile_id": profile_id, "players": len(profiles)}
+
+
+def assess_edge_rushers(store, game, *, profile_row=None, snapshot=None, now=None):
+    """Assess reported edge-rusher absences using role-based disruption profiles."""
+    now = now or utcnow(); db = AvailabilityStore(store)
+    profile_row = profile_row or db.latest_edge_profile(); profiles = json.loads(profile_row["profiles"]) if profile_row else []
+    raw = snapshot["records"] if snapshot else []; records = json.loads(raw) if isinstance(raw, str) else raw
+    team = game["team"]
+    unavailable = {p["player_id"] for record in records if record.get("team") == team and weight(record) > 0 for p, _ in [_resolve_player(record.get("player_name"), team, profiles)] if p}
+    details, total = [], 0.0
+    for record in records:
+        if record.get("team") != team or str(record.get("position", "")).upper() not in EDGE_POSITIONS: continue
+        player, confidence = _resolve_player(record.get("player_name"), team, profiles)
+        if not player or not weight(record): continue
+        replacement = max((p for p in profiles if p["team"] == team and p["player_id"] not in unavailable and p["player_id"] != player["player_id"]), key=lambda p: p["disruption_per_game"], default=None)
+        gap = max(0.0, player["disruption_per_game"] - (replacement["disruption_per_game"] if replacement else 0.0))
+        impact = -min(1.5, weight(record) * gap * .55); total += impact
+        details.append({"player_id": player["player_id"], "player_name": player["name"], "absence_weight": weight(record), "replacement": replacement and replacement["name"], "adjustment": round(impact, 2), "match_confidence": confidence, "status": record.get("game_status") or record.get("practice_status")})
+    detail = {"game_id": game["game_id"], "team": team, "snapshot_id": snapshot and snapshot.get("id"), "players": details, "adjustment": round(max(-2.5, total), 2), "reason": "Official EDGE availability adjustment" if details else "No reported matched EDGE availability issue"}
+    db.save_edge_assessment(detail, now); return detail
+
+
 def _resolve_player(name, team, profiles):
     candidates = [p for p in profiles if p["team"] == team]
     target = normalize_name(name or "")
@@ -447,9 +593,17 @@ def injury_adjusted_predictions(store, base_predictions, *, now=None):
         away = assess_availability(store, {"game_id": row["game_id"], "team": row["away_team"]}, profile_row=profile, snapshot=snapshot, now=now)
         home_wr = assess_wide_receivers(store, {"game_id": row["game_id"], "team": row["home_team"]}, snapshot=snapshot, now=now)
         away_wr = assess_wide_receivers(store, {"game_id": row["game_id"], "team": row["away_team"]}, snapshot=snapshot, now=now)
-        adjusted = round(float(row["predicted_margin"]) + home["adjustment"] - away["adjustment"] + home_wr["adjustment"] - away_wr["adjustment"], 2)
-        item = {"game_id":row["game_id"], "model_id":row.get("model_id", "baseline"), "created_at":now.isoformat(), "kickoff":row.get("gameday"), "base_margin":row["predicted_margin"], "adjusted_margin":adjusted, "assessments":[home,away,home_wr,away_wr]}
-        db.save_prediction(item); results.append({**row, "injury_adjusted_margin": adjusted, "availability_assessments": [home, away], "wr_assessments": [home_wr, away_wr], "availability_changes": [change for change in (home.get("change"), away.get("change")) if change]})
+        home_rb = assess_skill_position(store, {"game_id": row["game_id"], "team": row["home_team"]}, "RB", snapshot=snapshot, now=now)
+        away_rb = assess_skill_position(store, {"game_id": row["game_id"], "team": row["away_team"]}, "RB", snapshot=snapshot, now=now)
+        home_te = assess_skill_position(store, {"game_id": row["game_id"], "team": row["home_team"]}, "TE", snapshot=snapshot, now=now)
+        away_te = assess_skill_position(store, {"game_id": row["game_id"], "team": row["away_team"]}, "TE", snapshot=snapshot, now=now)
+        home_edge = assess_edge_rushers(store, {"game_id": row["game_id"], "team": row["home_team"]}, snapshot=snapshot, now=now)
+        away_edge = assess_edge_rushers(store, {"game_id": row["game_id"], "team": row["away_team"]}, snapshot=snapshot, now=now)
+        home_skill = round(max(-3.0, home_wr["adjustment"] + home_rb["adjustment"] + home_te["adjustment"]), 2)
+        away_skill = round(max(-3.0, away_wr["adjustment"] + away_rb["adjustment"] + away_te["adjustment"]), 2)
+        adjusted = round(float(row["predicted_margin"]) + home["adjustment"] - away["adjustment"] + home_skill - away_skill + home_edge["adjustment"] - away_edge["adjustment"], 2)
+        item = {"game_id":row["game_id"], "model_id":row.get("model_id", "baseline"), "created_at":now.isoformat(), "kickoff":row.get("gameday"), "base_margin":row["predicted_margin"], "adjusted_margin":adjusted, "assessments":[home,away,home_wr,away_wr,home_rb,away_rb,home_te,away_te,home_edge,away_edge]}
+        db.save_prediction(item); results.append({**row, "injury_adjusted_margin": adjusted, "availability_assessments": [home, away], "wr_assessments": [home_wr, away_wr], "rb_assessments": [home_rb, away_rb], "te_assessments": [home_te, away_te], "edge_assessments": [home_edge, away_edge], "skill_adjustments": [home_skill, away_skill], "availability_changes": [change for change in (home.get("change"), away.get("change")) if change]})
     return results
 
 

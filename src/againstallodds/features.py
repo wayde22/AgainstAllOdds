@@ -11,7 +11,8 @@ from againstallodds.nfl_stats import RATES
 from againstallodds.ratings import PowerRatingSystem
 from againstallodds.research_store import ResearchStore
 
-FEATURE_VERSION = "pregame-5-16-v1"
+FEATURE_VERSION = "pregame-5-16-v2"
+FEATURE_FAMILIES = ("raw", "rolling-adjusted", "srs")
 WINDOWS = (5, 16)
 
 
@@ -42,8 +43,11 @@ def rest_days(history, game):
     return min(21, max(0, (date.fromisoformat(game.gameday) - date.fromisoformat(prior[-1].gameday)).days)) if prior else 7
 
 
-def build_features(games, aggregates, before):
+def build_features(games, aggregates, before, family="raw"):
+    if family not in FEATURE_FAMILIES:
+        raise ValueError(f"Unknown feature family: {family}")
     histories = defaultdict(list)
+    opponents = defaultdict(list)
     system = PowerRatingSystem()
     rows = []
     ordered = sorted(games, key=lambda g: (g.gameday, g.game_id))
@@ -59,6 +63,19 @@ def build_features(games, aggregates, before):
                 missing = home[key] is None or away[key] is None
                 features[f"diff_{key}"] = None if missing else home[key] - away[key]
                 features[f"missing_{key}"] = int(missing)
+            if family == "rolling-adjusted":
+                # Ratings and opponent lists contain only completed earlier dates.
+                home_opp = [system.ratings[t] for t in opponents[game.home_team][-16:]]
+                away_opp = [system.ratings[t] for t in opponents[game.away_team][-16:]]
+                features["opponent_rating_difference"] = (sum(home_opp) / len(home_opp) if home_opp else 0.) - (sum(away_opp) / len(away_opp) if away_opp else 0.)
+                for window in WINDOWS:
+                    for side in ("off", "def"):
+                        key = f"diff_{side}_epa_{window}"
+                        features[f"opponent_adjusted_{side}_epa_{window}"] = None if features[key] is None else features[key] - .08 * features["opponent_rating_difference"]
+            elif family == "srs":
+                features["srs_home_rating"] = system.ratings[game.home_team]
+                features["srs_away_rating"] = system.ratings[game.away_team]
+                features["srs_margin"] = baseline
             actual = game.home_score - game.away_score if game.complete and day < before else None
             reasons = [f"Home: {r}" for r in home_errors] + [f"Away: {r}" for r in away_errors]
             rows.append({**game.to_dict(), "baseline_margin": baseline, "actual_margin": actual,
@@ -71,10 +88,12 @@ def build_features(games, aggregates, before):
             system.ratings[game.away_team] -= change
             histories[game.home_team].append((game, game.home_team))
             histories[game.away_team].append((game, game.away_team))
+            opponents[game.home_team].append(game.away_team)
+            opponents[game.away_team].append(game.home_team)
     return rows
 
 
-def feature_dataset(store, now=None, persist=True):
+def feature_dataset(store, now=None, persist=True, family="raw"):
     from zoneinfo import ZoneInfo
     from againstallodds.exceptions import AgainstAllOddsError
     now = now or utcnow()
@@ -87,7 +106,7 @@ def feature_dataset(store, now=None, persist=True):
     for item in stats.values():
         aggregates.update(json.loads(item["aggregates"]))
     cutoff = now.astimezone(ZoneInfo("America/New_York")).date().isoformat()
-    manifest = {"schedule": snapshot["id"], "statistics": {str(s): item["id"] for s, item in stats.items()}, "before": cutoff}
-    rows = build_features(store.games(snapshot), aggregates, cutoff)
+    manifest = {"schedule": snapshot["id"], "statistics": {str(s): item["id"] for s, item in stats.items()}, "before": cutoff, "family": family}
+    rows = build_features(store.games(snapshot), aggregates, cutoff, family)
     fid = research.save_features(manifest, FEATURE_VERSION, rows, now) if persist else None
     return fid, rows, manifest

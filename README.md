@@ -2,7 +2,8 @@
 
 A local NFL analytics dashboard that downloads real nflverse schedules and scores,
 evaluates a power-rating baseline, and records predictions before kickoff.
-Data stays on your computer. No API key or paid subscription is required.
+Data stays on your computer. No API key is required for schedules, statistics,
+or availability; live market odds are an optional integration.
 
 ## Run on Windows
 
@@ -96,6 +97,37 @@ integration. They are retrospective benchmarks, not proof of prices available
 when a prediction would have been made. Missing lines are excluded from market
 metrics and their coverage is displayed. No wagering-return claim is made.
 
+## Current market odds
+
+The optional market workflow saves immutable pregame spread snapshots from
+[Odds-API.io](https://docs.odds-api.io/quickstart), then uses the median home
+spread across returned sportsbooks as the displayed consensus. It does not run
+during ordinary schedule refreshes. Add this line to the untracked `.env` file
+in the project folder, then choose **Refresh market odds** in the sidebar:
+
+```text
+AGAINSTALLODDS_ODDS_API_KEY=your_key_here
+```
+
+By default the connection requests DraftKings and FanDuel. Change optional
+`AGAINSTALLODDS_ODDS_BOOKMAKERS` to a comma-separated list available to your
+account. The app stores every provider response and bookmaker line under
+`data/raw/odds/`, preserves prior data after failed refreshes, and displays the
+source time and number of contributing books.
+
+You can instead import a reviewed CSV from **Games** or the command line:
+
+```powershell
+python main.py sync-odds
+python main.py import-odds --file market-lines.csv
+```
+
+The required columns are `home_team`, `away_team`, `bookmaker`, and
+`home_spread`; `kickoff` and `captured_at` are optional. Team names must match
+the app's full NFL team names. A negative home spread means the home team is
+favored. The app converts it to its internal positive-home-margin convention
+before calculating consensus and model edge.
+
 ## Forward predictions
 
 Successful refreshes save upcoming games within seven days with known kickoffs,
@@ -106,8 +138,8 @@ inputs and training cutoffs are deduplicated; changes create revisions.
 Forward evaluation uses the latest saved prediction preceding both its recorded
 kickoff and the latest source kickoff, and evaluates after the game date. Source
 corrections can revise results but never the stored forecast. Already-started
-games cannot be backfilled; unknown kickoffs are excluded. There is no verified
-live odds feed for forward ATS evaluation in this release.
+games cannot be backfilled; unknown kickoffs are excluded. Forward ATS
+evaluation uses the market snapshot saved with each forecast when one exists.
 
 ## Original manual commands
 
@@ -133,9 +165,9 @@ They cover imports and rollback, corrections, aliases, chronological evaluation,
 spread signs, missing data, forward eligibility, dashboard views, and offline use.
 The test suite does not call the internet. `sync-nfl` is the real-source smoke check.
 
-College football and live sportsbook APIs remain later milestones. The optional
-Windows background injury checker is available from the Availability view; it
-only registers after an explicit user action. Rich statistics and model
+College football and historical odds reconstruction remain later milestones. The
+optional Windows background injury checker is available from the Availability
+view; it only registers after an explicit user action. Rich statistics and model
 comparison are described below.
 
 ## Rich NFL statistics and model research
@@ -176,6 +208,11 @@ scikit-learn version with backups or rerun training after a package upgrade.
 
 Both challengers receive home-minus-away differences over the previous 5 and
 16 games, with cross-season history and pooled play counts:
+
+The optional `rolling-adjusted` family adds opponent-rating-normalized EPA
+differences, while `srs` adds season-to-date schedule-adjusted ratings. Each
+family is trained and selected explicitly in **Model comparison**; neither
+replaces the raw forecast automatically.
 
 - Offensive and defensive EPA per play and success rate (EPA greater than zero).
 - Dropback EPA, including sacks and scrambles, and designed-rushing EPA.
@@ -247,7 +284,7 @@ forecast. The baseline and challenger historical comparisons are never rewritten
 In the dashboard, open **Availability**, then use these controls in order:
 
 1. Choose **Sync official injury report**; near kickoff, also choose **Sync official inactives**.
-2. Choose **Build QB profiles** after play-by-play statistics have been imported.
+2. Choose **Build QB profiles**, **Build WR profiles**, **Build RB/TE profiles**, and **Build EDGE profiles** after play-by-play statistics have been imported.
 3. Select the base projection model and choose **Calculate upcoming availability-adjusted forecasts**.
 4. Choose **Plan injury-report checks** to store the 7d/72h/24h/2h/85m/15m windows. Select **windows** and enable the background checker only when you want Windows Task Scheduler to run due checks every 15 minutes.
 
@@ -263,6 +300,8 @@ can trigger the optional Windows toast notification.
 python main.py sync-injuries
 python main.py build-qb-profiles
 python main.py build-wr-profiles
+python main.py build-rb-te-profiles
+python main.py build-edge-profiles
 python main.py predict-with-availability --model ridge-v1
 python main.py set-expected-qb --game-id 2026_01_NE_SEA --team "Seattle Seahawks" --player "Expected Quarterback" --reason "Confirmed starter"
 python main.py enable-windows-injury-checks
@@ -274,14 +313,19 @@ expected starter-versus-replacement difference in shrinkage-adjusted EPA per
 dropback, expected dropbacks, and a conservative 0.65 multiplier, capped at
 seven points. `set-expected-qb` saves a named override and its reason. Check
 windows are 7 days, 72 hours, 24 hours, 2 hours, 85 minutes, and 15 minutes
-before kickoff. Wide receiver availability is also included as a separate,
-conservative prospective adjustment based on rolling receiving EPA per game and
-the best available receiving replacement; it is capped at three points per
-team. The dashboard can keep that plan locally, or the explicitly
-enabled Windows runner can execute due checks every 15 minutes.
+before kickoff. Wide receiver, running back, and tight end availability are
+also included as conservative prospective adjustments. RB and TE replacements
+are selected from the same rushing or receiving role in retained play-by-play
+data, not a roster depth chart. All WR/RB/TE effects together are capped at
+three points per team. EDGE availability uses sacks plus quarterback hits and
+matches official `DE`, `OLB`, and `EDGE` labels to a retained pass-rush profile.
+It uses the best remaining profile as a replacement proxy and caps the team
+effect at 2.5 points. The dashboard can keep that plan locally, or the
+explicitly enabled Windows runner can execute due checks every 15 minutes.
 
 Experiments and their fitted models are immutable. Changed historical statistics
 require an explicit new experiment; failed downloads or training retain the
 previous usable data and models. Complete database and raw-file backups preserve
-provenance. College football, live odds, additional non-QB position groups,
-opponent-adjusted ratings, individual team scores, and automatic promotion remain future work.
+provenance. College football, historical odds reconstruction, offensive-line and
+defensive-back availability, individual team scores, and automatic promotion
+remain future work.

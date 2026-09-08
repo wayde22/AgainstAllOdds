@@ -2,7 +2,7 @@ from datetime import datetime, timedelta, timezone
 
 from againstallodds.analytics_store import AnalyticsStore
 from againstallodds import injuries
-from againstallodds.injuries import AvailabilityStore, assess_availability, assess_wide_receivers, current_report, notify_windows, parse_official, report_freshness
+from againstallodds.injuries import AvailabilityStore, assess_availability, assess_edge_rushers, assess_skill_position, assess_wide_receivers, current_report, injury_adjusted_predictions, notify_windows, parse_official, report_freshness
 
 
 NOW = datetime(2026, 9, 7, 12, tzinfo=timezone.utc)
@@ -88,4 +88,39 @@ def test_wide_receiver_assessment_uses_matched_official_status(tmp_path):
     result = assess_wide_receivers(store, {"game_id": "fixture", "team": "Detroit Lions"}, snapshot=report, now=NOW)
     assert result["players"][0]["player_name"] == "WR One"
     assert result["players"][0]["replacement"] == "WR Two"
+    assert result["adjustment"] < 0
+
+
+def test_rb_te_assessments_match_roles_and_skill_total_is_capped(tmp_path):
+    store = AnalyticsStore(tmp_path)
+    availability = AvailabilityStore(store)
+    availability.save_wr_profile({"fixture": "cap-wr"}, [{"player_id": "wr-one", "name": "WR One", "team": "Detroit Lions", "epa_per_game": 20}, {"player_id": "wr-two", "name": "WR Two", "team": "Detroit Lions", "epa_per_game": 0}], NOW)
+    profiles = {"RB": [{"player_id": "rb-one", "name": "RB One", "team": "Detroit Lions", "epa_per_game": 20}, {"player_id": "rb-two", "name": "RB Two", "team": "Detroit Lions", "epa_per_game": 0}], "TE": [{"player_id": "te-one", "name": "TE One", "team": "Detroit Lions", "epa_per_game": 20}, {"player_id": "te-two", "name": "TE Two", "team": "Detroit Lions", "epa_per_game": 0}]}
+    availability.save_rb_te_profile({"fixture": "cap-skill"}, profiles, NOW)
+    records = [{"player_name": name, "team": "Detroit Lions", "position": position, "game_status": "Out", "practice_status": "", "source": "injuries"} for name, position in [("WR One", "WR"), ("RB One", "RB"), ("TE One", "TE")]]
+    availability.snapshot("injuries", b"cap", records, NOW)
+    report = current_report(store)
+    rb = assess_skill_position(store, {"game_id": "fixture", "team": "Detroit Lions"}, "RB", snapshot=report, now=NOW)
+    te = assess_skill_position(store, {"game_id": "fixture", "team": "Detroit Lions"}, "TE", snapshot=report, now=NOW)
+    assert rb["players"][0]["replacement"] == "RB Two"
+    assert te["players"][0]["replacement"] == "TE Two"
+    rows = injury_adjusted_predictions(store, [{"game_id": "fixture", "home_team": "Detroit Lions", "away_team": "Chicago Bears", "home_score": None, "away_score": None, "gameday": "2026-09-10", "predicted_margin": 0.0, "model_id": "power-rating-v1"}], now=NOW)
+    assert rows[0]["skill_adjustments"][0] == -3.0
+
+
+def test_edge_assessment_uses_official_position_and_available_replacement(tmp_path):
+    store = AnalyticsStore(tmp_path)
+    availability = AvailabilityStore(store)
+    availability.save_edge_profile(
+        {"fixture": "edge"},
+        [
+            {"player_id": "edge-one", "name": "EDGE One", "team": "Detroit Lions", "disruption_per_game": 2.8},
+            {"player_id": "edge-two", "name": "EDGE Two", "team": "Detroit Lions", "disruption_per_game": 0.4},
+        ],
+        NOW,
+    )
+    report = {"id": "fixture", "records": [{"player_name": "EDGE One", "team": "Detroit Lions", "position": "DE", "game_status": "Out", "practice_status": "", "source": "injuries"}]}
+    result = assess_edge_rushers(store, {"game_id": "fixture", "team": "Detroit Lions"}, snapshot=report, now=NOW)
+    assert result["players"][0]["replacement"] == "EDGE Two"
+    assert result["players"][0]["match_confidence"] == "exact"
     assert result["adjustment"] < 0

@@ -43,6 +43,17 @@ class AnalyticsStore:
                     payload TEXT NOT NULL,
                     UNIQUE(snapshot_id, game_id, config));
                 CREATE INDEX IF NOT EXISTS predictions_game ON predictions(game_id, created_at);
+                CREATE TABLE IF NOT EXISTS market_snapshots (
+                    id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, source TEXT NOT NULL,
+                    raw_path TEXT NOT NULL, retrieved_at TEXT NOT NULL, records_json TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS market_imports (
+                    id INTEGER PRIMARY KEY, attempted_at TEXT NOT NULL,
+                    snapshot_id TEXT REFERENCES market_snapshots(id), error TEXT);
+                CREATE TABLE IF NOT EXISTS market_lines (
+                    snapshot_id TEXT NOT NULL REFERENCES market_snapshots(id), game_id TEXT NOT NULL,
+                    bookmaker TEXT NOT NULL, home_spread REAL NOT NULL, source_updated_at TEXT,
+                    PRIMARY KEY (snapshot_id, game_id, bookmaker, home_spread));
+                CREATE INDEX IF NOT EXISTS market_lines_game ON market_lines(game_id, snapshot_id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(predictions)")}
             if "model_id" not in columns:
@@ -122,3 +133,41 @@ class AnalyticsStore:
     def predictions(self):
         with self.connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM predictions ORDER BY created_at, id")]
+
+    def ingest_market(self, payload: bytes, lines, source: str, now):
+        digest = hashlib.sha256(payload).hexdigest(); snapshot_id = f"{source}:{digest}:{now.isoformat()}"
+        raw_dir = self.root / "raw" / "odds"; raw_dir.mkdir(parents=True, exist_ok=True)
+        raw_path = raw_dir / f"{digest}.json"
+        if not raw_path.exists():
+            temporary = None
+            try:
+                with tempfile.NamedTemporaryFile(dir=raw_dir, suffix=".tmp", delete=False) as file:
+                    temporary = Path(file.name); file.write(payload); file.flush(); os.fsync(file.fileno())
+                temporary.replace(raw_path)
+            finally:
+                if temporary is not None: temporary.unlink(missing_ok=True)
+        with self.connection() as db:
+            db.execute("INSERT OR IGNORE INTO market_snapshots VALUES (?,?,?,?,?,?)", (snapshot_id, digest, source, str(raw_path), now.isoformat(), json.dumps(lines, sort_keys=True)))
+            db.executemany("INSERT OR IGNORE INTO market_lines VALUES (?,?,?,?,?)", [(snapshot_id, row["game_id"], row["bookmaker"], row["home_spread"], row.get("source_updated_at")) for row in lines])
+            db.execute("INSERT INTO market_imports(attempted_at,snapshot_id) VALUES (?,?)", (now.isoformat(), snapshot_id))
+        return snapshot_id
+
+    def record_market_failure(self, error, now):
+        with self.connection() as db: db.execute("INSERT INTO market_imports(attempted_at,error) VALUES (?,?)", (now.isoformat(), str(error)))
+
+    def latest_market_snapshot(self, before=None):
+        with self.connection() as db:
+            if before is None:
+                row = db.execute("SELECT * FROM market_snapshots ORDER BY retrieved_at DESC LIMIT 1").fetchone()
+            else:
+                row = db.execute("SELECT * FROM market_snapshots WHERE retrieved_at<=? ORDER BY retrieved_at DESC LIMIT 1", (before.isoformat(),)).fetchone()
+        return dict(row) if row else None
+
+    def market_lines(self, snapshot_id):
+        with self.connection() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM market_lines WHERE snapshot_id=? ORDER BY game_id, bookmaker", (snapshot_id,))]
+
+    def last_market_error(self):
+        with self.connection() as db:
+            row = db.execute("SELECT error FROM market_imports WHERE error IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
+        return row[0] if row else None

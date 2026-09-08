@@ -71,7 +71,14 @@ class ResearchStore:
     def latest_experiment(self):
         with self.store.connection() as db:
             row = db.execute("SELECT * FROM experiments ORDER BY created_at DESC,rowid DESC LIMIT 1").fetchone()
-            return dict(row) if row else None
+        return dict(row) if row else None
+
+    def experiment_for_family(self, family):
+        with self.store.connection() as db:
+            row = db.execute("SELECT * FROM experiments WHERE specification LIKE ? ORDER BY created_at DESC LIMIT 1", (f'%"feature_family":"{family}"%',)).fetchone()
+            if row is None and family == "raw":
+                row = db.execute("SELECT * FROM experiments WHERE specification NOT LIKE '%feature_family%' ORDER BY created_at DESC LIMIT 1").fetchone()
+        return dict(row) if row else None
 
     def experiment(self, eid):
         with self.store.connection() as db:
