@@ -6,7 +6,9 @@ import hashlib
 import io
 import json
 import os
-from datetime import datetime, timezone
+import subprocess
+from datetime import datetime, timedelta, timezone
+from math import erf, sqrt
 from statistics import median
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -149,3 +151,59 @@ def consensus(store, *, now=None):
     for row in store.market_lines(snapshot["id"]):
         grouped.setdefault(row["game_id"], []).append(row)
     return ({game_id: {"market_margin": round(-median([line["home_spread"] for line in lines]), 2), "market_snapshot_id": snapshot["id"], "market_retrieved_at": snapshot["retrieved_at"], "market_books": len(lines)} for game_id, lines in grouped.items()}, snapshot)
+
+
+def market_check_plan(store, *, now=None):
+    now = now or utcnow(); checks = []
+    for game in store.games():
+        if game.complete or not game.kickoff: continue
+        kickoff = _parse_time(game.kickoff)
+        for hours, kind in ((72, "72h"), (66, "6h"), (60, "6h"), (54, "6h"), (48, "6h"), (42, "6h"), (36, "6h"), (30, "6h"), (24, "6h"), (18, "6h"), (12, "6h"), (6, "6h"), (3, "3h"), (2, "1h"), (1, "1h"), (.75, "15m"), (.5, "15m"), (.25, "15m")):
+            due = kickoff - timedelta(hours=hours)
+            if due > now: checks.append((game.game_id, due.isoformat(), kind))
+    store.save_market_checks(checks); return store.market_checks()
+
+
+def normal_probability(margin, threshold=0., sigma=13.5):
+    """Normal residual approximation; calibrated only after forward observations accrue."""
+    return .5 * (1 + erf((margin - threshold) / (sigma * sqrt(2))))
+
+
+def market_quality(store, forecasts):
+    """Attach conservative probabilities and market movement to forecast rows."""
+    output = []
+    for row in forecasts:
+        history = store.market_history(row["game_id"])
+        current = row.get("market_margin")
+        edge = row.get("edge")
+        probability = normal_probability(row["predicted_margin"])
+        cover = normal_probability(row["predicted_margin"], current) if current is not None else None
+        signal = bool(edge is not None and abs(edge) >= 2 and cover is not None and (cover >= .56 or cover <= .44))
+        if history:
+            first_retrieved_at = history[0]["retrieved_at"]
+            opening = -median([r["home_spread"] for r in history if r["retrieved_at"] == first_retrieved_at])
+            kickoff = row.get("kickoff")
+            before_kickoff = [r for r in history if not kickoff or r["retrieved_at"] <= kickoff]
+            final_retrieved_at = before_kickoff[-1]["retrieved_at"] if before_kickoff else None
+            final = -median([r["home_spread"] for r in before_kickoff if r["retrieved_at"] == final_retrieved_at]) if final_retrieved_at else None
+        else:
+            opening = None
+            final = None
+        output.append({**row, "opening_market_margin": opening, "final_market_margin": final, "line_movement": None if opening is None or current is None else round(current-opening,2), "closing_line_value": None if final is None or current is None else round(final-current, 2), "home_win_probability": round(probability, 3), "home_cover_probability": None if cover is None else round(cover, 3), "possible_edge": signal})
+    return output
+
+
+def register_windows_market_runner(data_dir):
+    """Create the opt-in 15-minute market refresh task."""
+    command = f'"{os.sys.executable}" "{os.path.abspath("main.py")}" --data-dir "{data_dir}" run-due-market-checks'
+    result = subprocess.run(["schtasks", "/Create", "/F", "/SC", "MINUTE", "/MO", "15", "/TN", "AgainstAllOdds-MarketChecks", "/TR", command], capture_output=True, text=True, check=False)
+    if result.returncode: raise AgainstAllOddsError(result.stderr.strip() or "Could not register market checker")
+    return {"task": "AgainstAllOdds-MarketChecks"}
+
+
+def run_due_market_checks(store, *, now=None):
+    now = now or utcnow(); due = [c for c in store.market_checks() if c["state"] == "planned" and c["due_at"] <= now.isoformat()]
+    if not due: return {"due": 0, "synced": False}
+    result = sync_odds(store, now=now)
+    with store.connection() as db: db.executemany("UPDATE market_checks SET state='done' WHERE game_id=? AND due_at=?", [(c["game_id"], c["due_at"]) for c in due])
+    return {"due": len(due), "synced": True, **result}

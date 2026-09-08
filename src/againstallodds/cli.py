@@ -89,6 +89,10 @@ def build_parser() -> argparse.ArgumentParser:
     comparison = subparsers.add_parser("compare-models", help="Run a frozen three-model experiment.")
     comparison.add_argument("--family", choices=["raw", "rolling-adjusted", "srs"], default="raw")
     subparsers.add_parser("sync-odds", help="Fetch and retain current NFL market spreads from the configured provider.")
+    subparsers.add_parser("sync-weather", help="Save forecast-time venue weather snapshots for upcoming games.")
+    subparsers.add_parser("plan-market-checks", help="Save the 72-hour, hourly, and final market-check windows.")
+    subparsers.add_parser("run-due-market-checks", help="Fetch market odds when a saved market-check window is due.")
+    subparsers.add_parser("enable-windows-market-checks", help="Register the opt-in Windows background market checker.")
     odds_import = subparsers.add_parser("import-odds", help="Import reviewed bookmaker spreads from a local CSV.")
     odds_import.add_argument("--file", type=Path, required=True, help="CSV with home_team, away_team, bookmaker, and home_spread columns.")
     injuries = subparsers.add_parser("sync-injuries", help="Save the current official NFL injury or inactive report.")
@@ -145,7 +149,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "dashboard":
             app = Path(__file__).with_name("dashboard.py")
             return subprocess.call([sys.executable, "-m", "streamlit", "run", str(app), "--server.address", "127.0.0.1", "--browser.gatherUsageStats", "false", "--", "--data-dir", str(args.data_dir.resolve())])
-        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-odds", "import-odds", "sync-injuries", "build-qb-profiles", "build-wr-profiles", "build-rb-te-profiles", "build-edge-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
+        if args.command in {"sync-nfl", "backtest", "predict-week", "sync-stats", "compare-models", "sync-odds", "sync-weather", "plan-market-checks", "run-due-market-checks", "enable-windows-market-checks", "import-odds", "sync-injuries", "build-qb-profiles", "build-wr-profiles", "build-rb-te-profiles", "build-edge-profiles", "predict-with-availability", "set-expected-qb", "run-due-injury-checks", "enable-windows-injury-checks"}:
             from againstallodds.analytics_store import AnalyticsStore
             from againstallodds.analytics import backtest, sync_nfl, upcoming
             analytics_store = AnalyticsStore(args.data_dir)
@@ -193,6 +197,18 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "sync-odds":
                 from againstallodds.odds import sync_odds
                 result = sync_odds(analytics_store)
+            elif args.command == "sync-weather":
+                from againstallodds.weather import sync_weather
+                result = sync_weather(analytics_store)
+            elif args.command == "plan-market-checks":
+                from againstallodds.odds import market_check_plan
+                result = market_check_plan(analytics_store)
+            elif args.command == "run-due-market-checks":
+                from againstallodds.odds import run_due_market_checks
+                result = run_due_market_checks(analytics_store)
+            elif args.command == "enable-windows-market-checks":
+                from againstallodds.odds import register_windows_market_runner
+                result = register_windows_market_runner(args.data_dir)
             elif args.command == "import-odds":
                 from againstallodds.odds import import_odds
                 result = import_odds(analytics_store, args.file.read_bytes())

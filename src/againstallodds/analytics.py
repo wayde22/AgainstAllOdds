@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timedelta
 from itertools import groupby
 
@@ -42,18 +43,30 @@ def metrics(rows):
     count = len(rows)
     decisive = [r for r in rows if r["actual_margin"] != 0 and r["predicted_margin"] != 0]
     lined = [r for r in rows if r["market_margin"] is not None]
+    closing = [r for r in rows if r.get("closing_line_value") is not None]
     thresholds = []
     for threshold in (1, 2, 3, 5):
         chosen = [r for r in lined if abs(r["predicted_margin"] - r["market_margin"]) > threshold]
         outcomes = [(r["actual_margin"] - r["market_margin"]) * (1 if r["predicted_margin"] > r["market_margin"] else -1) for r in chosen]
         wins, losses = sum(x > 0 for x in outcomes), sum(x < 0 for x in outcomes)
         thresholds.append({"edge_above": threshold, "games": len(chosen), "wins": wins, "losses": losses, "pushes": sum(x == 0 for x in outcomes), "win_rate": wins / (wins + losses) if wins + losses else None})
+    probability_rows = [r for r in rows if r.get("home_win_probability") is not None]
+    def outcome(row): return 1.0 if row["actual_margin"] > 0 else 0.0
+    brier = sum((r["home_win_probability"] - outcome(r)) ** 2 for r in probability_rows) / len(probability_rows) if probability_rows else None
+    log_score = sum(-(outcome(r) * math.log(max(r["home_win_probability"], 1e-6)) + (1 - outcome(r)) * math.log(max(1 - r["home_win_probability"], 1e-6))) for r in probability_rows) / len(probability_rows) if probability_rows else None
+    calibration = []
+    for lower in range(0, 100, 20):
+        bucket = [r for r in probability_rows if lower / 100 <= r["home_win_probability"] < (lower + 20) / 100]
+        if bucket:
+            calibration.append({"range": f"{lower}%–{lower + 20}%", "games": len(bucket), "mean_probability": sum(r["home_win_probability"] for r in bucket) / len(bucket), "home_win_rate": sum(outcome(r) for r in bucket) / len(bucket)})
     return {"games": count, "margin_mae": sum(abs(r["actual_margin"] - r["predicted_margin"]) for r in rows) / count if count else None,
             "winner_accuracy": sum(r["actual_margin"] * r["predicted_margin"] > 0 for r in decisive) / len(decisive) if decisive else None,
             "winner_samples": len(decisive), "ties": sum(r["actual_margin"] == 0 for r in rows), "pickems": sum(r["predicted_margin"] == 0 for r in rows),
             "line_games": len(lined), "missing_lines": count - len(lined),
             "market_mae": sum(abs(r["actual_margin"] - r["market_margin"]) for r in lined) / len(lined) if lined else None,
-            "model_mae_on_lined_games": sum(abs(r["actual_margin"] - r["predicted_margin"]) for r in lined) / len(lined) if lined else None, "thresholds": thresholds}
+            "model_mae_on_lined_games": sum(abs(r["actual_margin"] - r["predicted_margin"]) for r in lined) / len(lined) if lined else None,
+            "closing_line_coverage": len(closing), "mean_abs_closing_line_movement": sum(abs(r["closing_line_value"]) for r in closing) / len(closing) if closing else None,
+            "probability_games": len(probability_rows), "brier_score": brier, "log_score": log_score, "calibration": calibration, "thresholds": thresholds}
 
 
 def backtest(store, now=None):
@@ -83,7 +96,8 @@ def upcoming(store, now=None, save=False):
     games = store.games(snapshot)
     today = now.astimezone(nfl_data.ZoneInfo("America/New_York")).date().isoformat()
     _, system, _ = replay(games, snapshot["start_season"], snapshot["end_season"], before=today)
-    from againstallodds.odds import consensus
+    from againstallodds.odds import consensus, market_quality
+    from againstallodds.weather import venue_context, weather_summary
     market, market_snapshot = consensus(store, now=now)
     rows = []
     for g in games:
@@ -93,7 +107,10 @@ def upcoming(store, now=None, save=False):
         # Schedule reference lines are not verified point-in-time market observations.
         line = market.get(g.game_id, {})
         market_margin = line.get("market_margin")
-        rows.append({**g.to_dict(), "predicted_margin": margin, "market_margin": market_margin, "edge": None if market_margin is None else round(margin - market_margin, 2), **line})
+        venue = venue_context(store, g)
+        weather = weather_summary(store.latest_weather(g.game_id, before=now), g.kickoff)
+        rows.append({**g.to_dict(), "predicted_margin": margin, "market_margin": market_margin, "edge": None if market_margin is None else round(margin - market_margin, 2), **line, **venue, **weather})
+    rows = market_quality(store, rows)
     if save:
         store.save_predictions(snapshot["id"], {**CONFIG, "start": snapshot["start_season"], "end": snapshot["end_season"], "before": today, "market_snapshot_id": market_snapshot and market_snapshot["id"]}, rows, now)
     return rows
@@ -116,7 +133,8 @@ def forward_results(store, now=None, model_id="power-rating-v1"):
             continue
         p = json.loads(saved["payload"])
         selected[(g.game_id, model)] = {**p, "model_id": model, "actual_margin": g.home_score - g.away_score, "saved_at": saved["created_at"]}
-    return list(selected.values())
+    from againstallodds.odds import market_quality
+    return market_quality(store, list(selected.values()))
 
 
 def sync_nfl(store: AnalyticsStore, start=2015, end=2026, *, fetch=None, now=None):

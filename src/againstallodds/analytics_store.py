@@ -54,6 +54,9 @@ class AnalyticsStore:
                     bookmaker TEXT NOT NULL, home_spread REAL NOT NULL, source_updated_at TEXT,
                     PRIMARY KEY (snapshot_id, game_id, bookmaker, home_spread));
                 CREATE INDEX IF NOT EXISTS market_lines_game ON market_lines(game_id, snapshot_id);
+                CREATE TABLE IF NOT EXISTS market_checks (game_id TEXT NOT NULL, due_at TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'planned', UNIQUE(game_id,due_at));
+                CREATE TABLE IF NOT EXISTS weather_snapshots (id TEXT PRIMARY KEY, game_id TEXT NOT NULL, source TEXT NOT NULL, retrieved_at TEXT NOT NULL, forecast TEXT NOT NULL);
+                CREATE INDEX IF NOT EXISTS weather_game ON weather_snapshots(game_id,retrieved_at);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(predictions)")}
             if "model_id" not in columns:
@@ -167,7 +170,28 @@ class AnalyticsStore:
         with self.connection() as db:
             return [dict(row) for row in db.execute("SELECT * FROM market_lines WHERE snapshot_id=? ORDER BY game_id, bookmaker", (snapshot_id,))]
 
+    def market_history(self, game_id):
+        with self.connection() as db:
+            return [dict(row) for row in db.execute("SELECT s.retrieved_at,s.source,l.bookmaker,l.home_spread FROM market_lines l JOIN market_snapshots s ON s.id=l.snapshot_id WHERE l.game_id=? ORDER BY s.retrieved_at,l.bookmaker", (game_id,))]
+
     def last_market_error(self):
         with self.connection() as db:
             row = db.execute("SELECT error FROM market_imports WHERE error IS NOT NULL ORDER BY id DESC LIMIT 1").fetchone()
         return row[0] if row else None
+
+    def save_market_checks(self, checks):
+        with self.connection() as db: db.executemany("INSERT OR IGNORE INTO market_checks(game_id,due_at,kind) VALUES (?,?,?)", checks)
+
+    def market_checks(self):
+        with self.connection() as db: return [dict(r) for r in db.execute("SELECT * FROM market_checks ORDER BY due_at")]
+
+    def save_weather(self, game_id, source, forecast, now):
+        payload = json.dumps(forecast, sort_keys=True); ident = hashlib.sha256(f"{game_id}:{source}:{now.isoformat()}:{payload}".encode()).hexdigest()
+        with self.connection() as db: db.execute("INSERT OR IGNORE INTO weather_snapshots VALUES (?,?,?,?,?)", (ident, game_id, source, now.isoformat(), payload))
+        return ident
+
+    def latest_weather(self, game_id, before=None):
+        with self.connection() as db:
+            query, params = ("SELECT * FROM weather_snapshots WHERE game_id=? ORDER BY retrieved_at DESC LIMIT 1", (game_id,)) if before is None else ("SELECT * FROM weather_snapshots WHERE game_id=? AND retrieved_at<=? ORDER BY retrieved_at DESC LIMIT 1", (game_id, before.isoformat()))
+            row = db.execute(query, params).fetchone()
+        return dict(row) if row else None

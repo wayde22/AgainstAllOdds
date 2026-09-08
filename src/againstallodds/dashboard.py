@@ -51,7 +51,7 @@ def main():
     store = AnalyticsStore(args.data_dir)
     with st.sidebar:
         st.header("NFL workspace")
-        view = st.radio("View", ["Games", "Teams", "Performance", "Model comparison", "Availability"])
+        view = st.radio("View", ["Games", "Teams", "Performance", "Model comparison", "Market quality", "Availability"])
         refresh = st.button("Refresh data", type="primary", width="stretch")
         refresh_odds = st.button("Refresh market odds", width="stretch")
     session_key = f"initial_refresh:{store.path.resolve()}"
@@ -91,6 +91,37 @@ def main():
     if view == "Model comparison":
         from againstallodds.research_ui import comparison_view
         comparison_view(store)
+        return
+    if view == "Market quality":
+        from againstallodds.odds import market_check_plan, register_windows_market_runner
+        from againstallodds.weather import sync_weather
+        st.subheader("Market quality")
+        st.caption("Saved forward prices and forecast-time weather are kept separately from football-strength training. Possible edges are analytical signals, not recommendations.")
+        weather, plan, enable = st.columns(3)
+        if weather.button("Sync venue weather", width="stretch"):
+            try:
+                st.success(f"Saved {len(sync_weather(store))} immutable venue forecast snapshots.")
+            except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
+                st.error(f"Weather sync failed. {error}")
+        if plan.button("Plan market checks", width="stretch"):
+            checks = market_check_plan(store)
+            st.success(f"Saved {len(checks)} future market-check windows.")
+        if enable.button("Enable 15-minute Windows market checker", width="stretch"):
+            try:
+                st.success(f"Registered {register_windows_market_runner(store.root)['task']}.")
+            except (AgainstAllOddsError, OSError) as error:
+                st.error(f"Windows scheduler setup failed: {error}")
+        rows = upcoming(store)
+        saved = [r for r in rows if r.get("market_snapshot_id")]
+        st.metric("Forecast-time market-line coverage", f"{len(saved)} / {len(rows)} upcoming games")
+        if rows:
+            shown = [{"Date": r["gameday"], "Away": r["away_team"], "Home": r["home_team"], "Model home margin": r["predicted_margin"], "Opening market": r.get("opening_market_margin"), "Current market": r.get("market_margin"), "Final pre-kickoff": r.get("final_market_margin"), "Closing-line movement": r.get("closing_line_value"), "Movement": r.get("line_movement"), "Model − market": r.get("edge"), "Home win probability": r.get("home_win_probability"), "Home cover probability": r.get("home_cover_probability"), "Possible edge": r.get("possible_edge"), "Books": r.get("market_books"), "Weather roof": r.get("venue_roof"), "Weather snapshot": r.get("weather_retrieved_at")} for r in rows]
+            st.dataframe(pd.DataFrame(shown), hide_index=True, width="stretch")
+        else:
+            st.info("There are no upcoming games with kickoffs in the next seven days.")
+        checks = store.market_checks()
+        if checks:
+            st.caption(f"Stored check windows: {len(checks)}. The Windows runner remains inactive until enabled here or with enable-windows-market-checks.")
         return
     if view == "Availability":
         from againstallodds.injuries import AvailabilityStore, build_qb_profiles, build_wr_profiles, build_rb_te_profiles, build_edge_profiles, sync_injuries, injury_adjusted_predictions, plan_injury_checks, current_report, report_freshness

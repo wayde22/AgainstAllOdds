@@ -120,6 +120,9 @@ You can instead import a reviewed CSV from **Games** or the command line:
 ```powershell
 python main.py sync-odds
 python main.py import-odds --file market-lines.csv
+python main.py sync-weather
+python main.py plan-market-checks
+python main.py run-due-market-checks
 ```
 
 The required columns are `home_team`, `away_team`, `bookmaker`, and
@@ -127,6 +130,56 @@ The required columns are `home_team`, `away_team`, `bookmaker`, and
 the app's full NFL team names. A negative home spread means the home team is
 favored. The app converts it to its internal positive-home-margin convention
 before calculating consensus and model edge.
+
+For forward collection without an API key, copy
+`market-lines.example.csv` to a new local `market-lines.csv`, replace the sample
+row with reviewed sportsbook spreads, and import it at each planned checkpoint.
+Keep one row per game and bookmaker. Do not reuse the example's past game or
+timestamp: each import saves the CSV exactly as it was captured, so `captured_at`
+should describe when the reviewed line was observed.
+
+## Market-calibrated forecast workflow
+
+Choose **Market quality** to review each current forecast against its first and
+latest saved consensus, the line movement, model-minus-market difference, and
+forecast-time market-line coverage. A snapshot records its retrieval time,
+source, returned bookmakers, and every raw bookmaker spread; a failed import
+does not replace a prior snapshot. Opening and closing comparisons only become
+meaningful after the app has collected forward observations. nflverse reference
+spreads remain historical benchmarks and are never displayed as a price that was
+available when a forecast was made.
+
+The app converts projected home margins to initial home-win and home-cover
+probabilities with a conservative normal residual approximation. Brier and log
+scores are reported when saved forecasts later have results. These values are
+calibrated estimates only after a sufficient forward sample exists. Market data
+is excluded from football-strength training; any later market-residual study
+uses only timestamped saved observations.
+
+Choose **Sync venue weather** in Market quality, or run `sync-weather`, to save
+an immutable free [Open-Meteo](https://open-meteo.com/) forecast response for
+each upcoming venue. The local stadium reference records roof type, surface,
+and city coordinates; forecasts also retain away-team travel distance, rest,
+and time-zone difference. Outdoor snapshots retain temperature, wind, and
+precipitation at the forecast hour nearest kickoff. Missing weather leaves the forecast usable.
+These features are prospective context and are not training inputs yet, because
+the app has no timestamped historical weather archive.
+
+Choose **Plan market checks** to save refresh windows: every six hours until 72
+hours before kickoff, hourly from three hours before, and every 15 minutes in
+the final hour. `run-due-market-checks` only acts on saved due windows. The
+optional 15-minute Windows task is registered only after an explicit action in
+Market quality or `python main.py enable-windows-market-checks`; ordinary app
+launches never create it. A possible edge requires at least a two-point model
+difference plus a conservative cover-probability threshold. It is labeled an
+analytical signal, not a recommendation, and does not account for a sportsbook
+margin until specific offered prices are available.
+
+With the reviewed CSV workflow, use the stored windows as prompts: update your
+local CSV, import it from **Games**, and choose **Sync venue weather** in
+**Market quality**. The CSV importer preserves every successful file as a new
+immutable snapshot. It does not require an API key and it does not enable a
+Windows scheduled task.
 
 ## Forward predictions
 

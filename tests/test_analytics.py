@@ -183,6 +183,8 @@ def test_dashboard_views_and_filters(tmp_path, monkeypatch):
     assert not app.exception
     next(r for r in app.radio if r.label == "Evaluation").set_value("Saved forward predictions").run()
     assert not app.exception
+    app.sidebar.radio[0].set_value("Market quality").run()
+    assert not app.exception
 
 
 def test_dashboard_empty_and_offline_refresh(tmp_path, monkeypatch):
