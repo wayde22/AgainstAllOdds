@@ -6,6 +6,7 @@ import html.parser
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -500,6 +501,33 @@ def build_edge_profiles(store, *, now=None):
     return {"profile_id": profile_id, "players": len(profiles)}
 
 
+def refresh_all_availability_data(
+    store,
+    *,
+    sync_report=sync_injuries,
+    build_qb=build_qb_profiles,
+    build_wr=build_wr_profiles,
+    build_rb_te=build_rb_te_profiles,
+    build_edge=build_edge_profiles,
+):
+    """Refresh official reports and all local player profiles without stopping on one failure."""
+    steps = (
+        ("Official injury report", lambda: sync_report(store), lambda result: f"{result['records']} report rows"),
+        ("Official inactives", lambda: sync_report(store, source="inactives"), lambda result: f"{result['records']} inactive rows"),
+        ("QB profiles", lambda: build_qb(store), lambda result: f"{result['players']} players"),
+        ("WR profiles", lambda: build_wr(store), lambda result: f"{result['players']} players"),
+        ("RB/TE profiles", lambda: build_rb_te(store), lambda result: f"{result['running_backs']} RB and {result['tight_ends']} TE players"),
+        ("EDGE profiles", lambda: build_edge(store), lambda result: f"{result['players']} players"),
+    )
+    outcomes = []
+    for label, action, describe in steps:
+        try:
+            outcomes.append({"step": label, "success": True, "detail": describe(action())})
+        except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
+            outcomes.append({"step": label, "success": False, "detail": str(error)})
+    return outcomes
+
+
 def assess_edge_rushers(store, game, *, profile_row=None, snapshot=None, now=None):
     """Assess reported edge-rusher absences using role-based disruption profiles."""
     now = now or utcnow(); db = AvailabilityStore(store)
@@ -605,6 +633,31 @@ def injury_adjusted_predictions(store, base_predictions, *, now=None):
         item = {"game_id":row["game_id"], "model_id":row.get("model_id", "baseline"), "created_at":now.isoformat(), "kickoff":row.get("gameday"), "base_margin":row["predicted_margin"], "adjusted_margin":adjusted, "assessments":[home,away,home_wr,away_wr,home_rb,away_rb,home_te,away_te,home_edge,away_edge]}
         db.save_prediction(item); results.append({**row, "injury_adjusted_margin": adjusted, "availability_assessments": [home, away], "wr_assessments": [home_wr, away_wr], "rb_assessments": [home_rb, away_rb], "te_assessments": [home_te, away_te], "edge_assessments": [home_edge, away_edge], "skill_adjustments": [home_skill, away_skill], "availability_changes": [change for change in (home.get("change"), away.get("change")) if change]})
     return results
+
+
+def capture_all_availability_forecasts(store, *, now=None, forecast_models=None, adjust_predictions=None):
+    """Save all available base forecasts, then their availability-adjusted counterparts.
+
+    A challenger without a fitted artifact is reported but does not prevent the
+    baseline or any available challenger from being preserved at this checkpoint.
+    """
+    now = now or utcnow()
+    if forecast_models is None:
+        from againstallodds.experiments import predict_models
+        forecast_models = predict_models
+    if adjust_predictions is None:
+        adjust_predictions = injury_adjusted_predictions
+
+    base_rows = forecast_models(store, now=now, save=True, model="all", capture_id=now.isoformat())
+    available = [row for row in base_rows if row.get("available") and row.get("predicted_margin") is not None]
+    unavailable = [row for row in base_rows if row not in available]
+    adjusted = adjust_predictions(store, available, now=now) if available else []
+    return {
+        "base_rows": base_rows,
+        "available_rows": available,
+        "unavailable_rows": unavailable,
+        "adjusted_rows": adjusted,
+    }
 
 
 CHECK_OFFSETS_HOURS = (168, 72, 24, 2, 85 / 60, 15 / 60)

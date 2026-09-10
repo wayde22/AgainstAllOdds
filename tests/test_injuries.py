@@ -14,6 +14,57 @@ def test_official_table_parser_retains_report_fields():
     assert records == [{"player_name": "QB One", "position": "QB", "injury": "Shoulder", "practice_status": "Limited", "game_status": "Questionable", "team_hint": "Detroit Lions", "source": "injuries"}]
 
 
+def test_refresh_all_availability_data_continues_after_a_failure():
+    calls = []
+
+    def sync(store, *, source="injuries"):
+        calls.append(source)
+        if source == "inactives":
+            raise injuries.AgainstAllOddsError("Inactive report unavailable")
+        return {"records": 12}
+
+    def qb(store):
+        calls.append("qb"); return {"players": 30}
+
+    def wr(store):
+        calls.append("wr"); return {"players": 60}
+
+    def rb_te(store):
+        calls.append("rb_te"); return {"running_backs": 40, "tight_ends": 32}
+
+    def edge(store):
+        calls.append("edge"); return {"players": 28}
+
+    outcomes = injuries.refresh_all_availability_data(
+        object(), sync_report=sync, build_qb=qb, build_wr=wr, build_rb_te=rb_te, build_edge=edge,
+    )
+    assert calls == ["injuries", "inactives", "qb", "wr", "rb_te", "edge"]
+    assert [outcome["success"] for outcome in outcomes] == [True, False, True, True, True, True]
+    assert outcomes[1] == {"step": "Official inactives", "success": False, "detail": "Inactive report unavailable"}
+
+
+def test_capture_all_availability_forecasts_saves_available_models_and_skips_unavailable():
+    calls = []
+
+    def forecasts(store, *, now, save, model, capture_id):
+        calls.append(("forecasts", now, save, model, capture_id))
+        return [
+            {"game_id": "game", "model_id": "power-rating-v1", "predicted_margin": 2.0, "available": True},
+            {"game_id": "game", "model_id": "ridge-v1", "predicted_margin": None, "available": False, "exclusion": "No frozen model artifact."},
+        ]
+
+    def adjust(store, rows, *, now):
+        calls.append(("adjust", rows, now))
+        return [{**rows[0], "injury_adjusted_margin": 1.5}]
+
+    result = injuries.capture_all_availability_forecasts(object(), now=NOW, forecast_models=forecasts, adjust_predictions=adjust)
+    assert [row["model_id"] for row in result["available_rows"]] == ["power-rating-v1"]
+    assert [row["model_id"] for row in result["unavailable_rows"]] == ["ridge-v1"]
+    assert len(result["adjusted_rows"]) == 1
+    assert calls[0] == ("forecasts", NOW, True, "all", NOW.isoformat())
+    assert calls[1][0] == "adjust"
+
+
 def test_qb_assessment_uses_official_status_and_keeps_base_forecast_separate(tmp_path):
     store = AnalyticsStore(tmp_path)
     availability = AvailabilityStore(store)

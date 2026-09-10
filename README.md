@@ -20,12 +20,23 @@ Later launches refresh if the last successful check is at least six hours old.
 **Refresh data** downloads on demand. Failed downloads leave cached data
 available. Switching views does not download.
 
-**Games** shows schedules, scores, and projected spreads. Use the compact
+Use the sidebar navigation buttons to switch views; the highlighted button is
+the screen currently open. Hover over a sidebar button for two seconds to see a
+short description of its purpose. **Games** shows schedules, scores, and projected spreads. Use the compact
 **Projection model**, **Season**, and **Week** filters on one row to narrow the
 table. Upcoming estimates cover seven days; missing kickoff times and warm-up
 games have no projection.
+
+The **NFL data** and **Market data** status lights beneath the title show saved
+snapshot freshness: green is under two hours old, yellow is from two to under
+six hours old, red is six or more hours old, and gray means no snapshot has
+been saved. Status timestamps are displayed in Central time; saved records and
+freshness calculations remain in UTC.
 **Teams** shows ratings and their history. **Performance** separates historical
 simulations from predictions actually saved before kickoff.
+Choose **Help & guide** in the sidebar for a read-only walkthrough of every
+dashboard view, control, grid, metric, and key term. It works without a data
+refresh or internet connection.
 
 ## Analytics commands
 
@@ -334,12 +345,15 @@ and parsed rows before making an adjustment. Build rolling 16-game quarterback
 profiles from the retained play-by-play data, then calculate a separate upcoming
 forecast. The baseline and challenger historical comparisons are never rewritten.
 
-In the dashboard, open **Availability**, then use these controls in order:
+In the dashboard, open **Availability**, then use **Update all availability data**
+to refresh both official reports and all four player-profile groups. The six
+individual controls remain available when only one source or profile group needs
+an update. Then:
 
-1. Choose **Sync official injury report**; near kickoff, also choose **Sync official inactives**.
-2. Choose **Build QB profiles**, **Build WR profiles**, **Build RB/TE profiles**, and **Build EDGE profiles** after play-by-play statistics have been imported.
-3. Select the base projection model and choose **Calculate upcoming availability-adjusted forecasts**.
-4. Choose **Plan injury-report checks** to store the 7d/72h/24h/2h/85m/15m windows. Select **windows** and enable the background checker only when you want Windows Task Scheduler to run due checks every 15 minutes.
+1. Select the base projection model and choose **Calculate upcoming availability-adjusted forecasts**.
+2. Choose **Plan injury-report checks** to store the 7d/72h/24h/2h/85m/15m windows. Select **windows** and enable the background checker only when you want Windows Task Scheduler to run due checks every 15 minutes.
+
+At a planned pre-kickoff checkpoint, use **Save current all-model forecasts**. It saves the available baseline, Ridge, and boosted-tree forecasts, then saves matching availability-adjusted forecasts. It creates a new immutable record each time, so use it after a reviewed market CSV, venue-weather sync, and availability update when you want to retain that exact forecast-time context.
 
 The forecast table shows the original home-margin estimate and the adjusted
 home-margin estimate. A positive adjustment favors the home team; a negative

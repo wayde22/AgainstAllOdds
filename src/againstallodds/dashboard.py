@@ -2,10 +2,13 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import sqlite3
 import sys
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -15,6 +18,118 @@ import streamlit as st
 from againstallodds.analytics import backtest, forward_results, metrics, sync_nfl, upcoming
 from againstallodds.analytics_store import AnalyticsStore
 from againstallodds.exceptions import AgainstAllOddsError
+from againstallodds.nfl_data import utcnow
+
+
+VIEWS = (
+    "Games",
+    "Teams",
+    "Performance",
+    "Model comparison",
+    "Market quality",
+    "Availability",
+    "Help & guide",
+)
+
+VIEW_HELP = {
+    "Games": "Review schedules, projections, saved market lines, and import a reviewed odds CSV.",
+    "Teams": "Review team ratings, rating history, and recent team statistics.",
+    "Performance": "Compare historical results with predictions that were saved before kickoff.",
+    "Model comparison": "Compare the power-rating baseline with the Ridge and boosted-tree models.",
+    "Market quality": "Review saved odds, line movement, weather context, and forecast calibration.",
+    "Availability": "Review official injuries and inactives, then calculate player-availability adjustments.",
+    "Help & guide": "Open a read-only guide explaining the dashboard, controls, tables, and metrics.",
+}
+
+REFRESH_HELP = {
+    "refresh_data": "Download the latest NFL schedule and statistics. A failed download leaves your last successful data available.",
+    "refresh_market_odds": "Fetch and save current sportsbook spreads when an odds provider is configured. Earlier saved snapshots are preserved.",
+}
+
+
+def navigation_key(view: str) -> str:
+    return f"navigate_{view.lower().replace(' ', '_').replace('&', 'and')}"
+
+
+def sidebar_tooltip_styles() -> str:
+    tooltips = {navigation_key(view): text for view, text in VIEW_HELP.items()} | REFRESH_HELP
+    content_rules = "\n".join(
+        f'[data-testid="stSidebar"] [class*="st-key-{key}"] .stButton::after {{content:"{text}";}}'
+        for key, text in tooltips.items()
+    )
+    return f"""
+    [data-testid="stSidebar"] {{z-index:10000;overflow:visible!important}}
+    [data-testid="stSidebarContent"],
+    [data-testid="stSidebarUserContent"] {{overflow:visible!important}}
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"],
+    [data-testid="stSidebar"] [class*="st-key-refresh_data"],
+    [data-testid="stSidebar"] [class*="st-key-refresh_market_odds"] {{overflow:visible}}
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton,
+    [data-testid="stSidebar"] [class*="st-key-refresh_data"] .stButton,
+    [data-testid="stSidebar"] [class*="st-key-refresh_market_odds"] .stButton {{position:relative;overflow:visible}}
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton::after,
+    [data-testid="stSidebar"] [class*="st-key-refresh_data"] .stButton::after,
+    [data-testid="stSidebar"] [class*="st-key-refresh_market_odds"] .stButton::after {{
+        position:absolute;
+        left:calc(100% + .65rem);
+        top:50%;
+        width:17rem;
+        padding:.55rem .7rem;
+        border:1px solid #4a7895;
+        border-radius:.35rem;
+        background:#172b43;
+        color:#edf2fa;
+        font-size:.8rem;
+        font-weight:400;
+        line-height:1.35;
+        text-align:left;
+        transform:translateY(-50%);
+        opacity:0;
+        pointer-events:none;
+        transition:opacity .15s ease;
+        transition-delay:0s;
+        z-index:10001;
+    }}
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton:hover::after,
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton:focus-within::after,
+    [data-testid="stSidebar"] [class*="st-key-refresh_data"] .stButton:hover::after,
+    [data-testid="stSidebar"] [class*="st-key-refresh_data"] .stButton:focus-within::after,
+    [data-testid="stSidebar"] [class*="st-key-refresh_market_odds"] .stButton:hover::after,
+    [data-testid="stSidebar"] [class*="st-key-refresh_market_odds"] .stButton:focus-within::after {{
+        opacity:1;
+        transition-delay:2s;
+    }}
+    {content_rules}
+    """
+
+
+def freshness_status(timestamp: str | None, now=None) -> dict:
+    if not timestamp:
+        return {"tone": "unavailable", "label": "Unavailable"}
+    age_seconds = max(0, ((now or utcnow()) - datetime.fromisoformat(timestamp)).total_seconds())
+    if age_seconds < 2 * 60 * 60:
+        return {"tone": "fresh", "label": "Fresh"}
+    if age_seconds < 6 * 60 * 60:
+        return {"tone": "aging", "label": "Aging"}
+    return {"tone": "stale", "label": "Stale"}
+
+
+def format_dashboard_timestamp(timestamp: str | None) -> str | None:
+    if not timestamp:
+        return None
+    local = datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(ZoneInfo("America/Chicago"))
+    return f"{local.month}-{local.day}-{local.year} {local.strftime('%I:%M:%S %p').lstrip('0')} {local.tzname()}"
+
+
+def freshness_chip(label: str, timestamp: str | None, detail: str) -> str:
+    status = freshness_status(timestamp)
+    tooltip = f"{label}: {status['label']}. {detail}"
+    return (
+        f'<div class="freshness-chip {status["tone"]}" role="status" tabindex="0" '
+        f'aria-label="{html.escape(tooltip, quote=True)}" data-tooltip="{html.escape(tooltip, quote=True)}">'
+        f'<span class="freshness-dot"></span><span><strong>{html.escape(label)} · {status["label"]}</strong>'
+        f'<span class="freshness-detail">{html.escape(detail)}</span></span></div>'
+    )
 
 
 def format_line(row):
@@ -40,20 +155,85 @@ def main():
     parser.add_argument("--data-dir", default="data")
     args, _ = parser.parse_known_args()
     st.set_page_config(page_title="AgainstAllOdds · NFL analytics", page_icon="🏈", layout="wide")
-    st.markdown("""<style>
+    styles = """<style>
     .stApp {background:#0b1320;color:#edf2fa}
     [data-testid="stSidebar"] {background:#111e31}
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton button {
+        border:1px solid #28445f;
+        background:#15263b;
+        color:#edf2fa;
+        justify-content:flex-start;
+        transition:background .15s ease,border-color .15s ease,box-shadow .15s ease;
+    }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton button:hover {
+        background:#1b334d;
+        border-color:#4a7895;
+    }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton button[kind="primary"] {
+        background:#1b4b5f;
+        border-color:#43d9aa;
+        box-shadow:inset 3px 0 #43d9aa;
+    }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton button[kind="primary"]:hover {
+        background:#225d74;
+        border-color:#77ebc6;
+    }
+    [data-testid="stSidebar"] [class*="st-key-sidebar_navigation"] .stButton button:focus-visible {
+        outline:2px solid #77ebc6;
+        outline-offset:2px;
+    }
+    [data-testid="stSidebar"] .sidebar-action-gap {height:.9rem}
+    .status-filter-gap {height:1rem}
+    .freshness-chip {position:relative;display:flex;align-items:flex-start;gap:.5rem;min-height:3.8rem;padding:.6rem .7rem;border:1px solid #36516b;border-radius:.45rem;background:#132138;color:#edf2fa}
+    .freshness-chip strong {display:block;font-size:.86rem}
+    .freshness-detail {display:block;margin-top:.15rem;color:#b7c6d9;font-size:.72rem;line-height:1.35}
+    .freshness-dot {flex:0 0 .62rem;width:.62rem;height:.62rem;margin-top:.24rem;border-radius:50%;background:#8795a5}
+    .freshness-chip.fresh .freshness-dot {background:#43d9aa;box-shadow:0 0 0 .18rem #43d9aa22}
+    .freshness-chip.aging .freshness-dot {background:#f0bf4c;box-shadow:0 0 0 .18rem #f0bf4c22}
+    .freshness-chip.stale .freshness-dot {background:#ff5c65;box-shadow:0 0 0 .18rem #ff5c6522}
+    .freshness-chip.unavailable .freshness-dot {background:#8795a5}
+    .freshness-chip::after {position:absolute;left:0;top:calc(100% + .4rem);width:17rem;padding:.5rem .65rem;border:1px solid #4a7895;border-radius:.35rem;background:#172b43;color:#edf2fa;content:attr(data-tooltip);font-size:.76rem;line-height:1.35;opacity:0;pointer-events:none;transition:opacity .15s ease;z-index:10002}
+    .freshness-chip:hover::after,.freshness-chip:focus::after {opacity:1}
+    .freshness-chip:focus-visible {outline:2px solid #77ebc6;outline-offset:2px}
     h1,h2,h3 {letter-spacing:-.025em}
     [data-testid="stMetric"] {border-top:3px solid #43d9aa;padding:16px 8px;background:#132138}
-    </style>""", unsafe_allow_html=True)
+    /* SIDEBAR_TOOLTIP_STYLES */
+    </style>"""
+    st.markdown(styles.replace("/* SIDEBAR_TOOLTIP_STYLES */", sidebar_tooltip_styles()), unsafe_allow_html=True)
     st.title("AgainstAllOdds")
     st.caption("NFL analytics · Ratings, richer statistics, and model research")
     store = AnalyticsStore(args.data_dir)
     with st.sidebar:
         st.header("NFL workspace")
-        view = st.radio("View", ["Games", "Teams", "Performance", "Model comparison", "Market quality", "Availability"])
-        refresh = st.button("Refresh data", type="primary", width="stretch")
-        refresh_odds = st.button("Refresh market odds", width="stretch")
+        if "active_view" not in st.session_state:
+            st.session_state.active_view = "Games"
+        with st.container(key="sidebar_navigation"):
+            for candidate in VIEWS:
+                if st.button(
+                    candidate,
+                    key=navigation_key(candidate),
+                    type="primary" if candidate == st.session_state.active_view else "secondary",
+                    width="stretch",
+                ):
+                    st.session_state.active_view = candidate
+                    st.rerun()
+        view = st.session_state.active_view
+        st.markdown("<div class='sidebar-action-gap'></div>", unsafe_allow_html=True)
+        refresh = st.button(
+            "Refresh data",
+            key="refresh_data",
+            type="primary",
+            width="stretch",
+        )
+        refresh_odds = st.button(
+            "Refresh market odds",
+            key="refresh_market_odds",
+            width="stretch",
+        )
+    if view == "Help & guide":
+        from againstallodds.help_view import render_help
+        render_help()
+        return
     session_key = f"initial_refresh:{store.path.resolve()}"
     should_refresh = refresh or (session_key not in st.session_state and store.stale())
     st.session_state[session_key] = True
@@ -75,6 +255,19 @@ def main():
         except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
             st.error(f"Market refresh failed. {error}")
     snapshot = store.latest()
+    market_snapshot = store.latest_market_snapshot()
+    nfl_detail = (
+        f"Last successful check: {format_dashboard_timestamp(snapshot['checked_at'])} · nflverse · Seasons {snapshot['start_season']}–{snapshot['end_season']}"
+        if snapshot else "No saved NFL snapshot. Choose Refresh data to download schedules and statistics."
+    )
+    market_detail = (
+        f"Retrieved: {format_dashboard_timestamp(market_snapshot['retrieved_at'])} · {market_snapshot['source']} · Median saved-book consensus"
+        if market_snapshot else "No saved odds snapshot. Import a reviewed CSV or configure the optional odds provider."
+    )
+    nfl_status, market_status = st.columns(2)
+    nfl_status.markdown(freshness_chip("NFL data", snapshot and snapshot["checked_at"], nfl_detail), unsafe_allow_html=True)
+    market_status.markdown(freshness_chip("Market data", market_snapshot and market_snapshot["retrieved_at"], market_detail), unsafe_allow_html=True)
+    st.markdown("<div class='status-filter-gap'></div>", unsafe_allow_html=True)
     if not snapshot:
         st.info("No NFL data has been imported yet. Connect to the internet and choose Refresh data. No API key is needed.")
         st.stop()
@@ -82,11 +275,7 @@ def main():
         st.warning("The last refresh failed. Showing the last successful import; you can keep exploring it offline.")
     elif store.stale():
         st.warning("The saved data is more than six hours old. Refresh for the latest schedule.")
-    st.caption(f"Source: nflverse · Last checked: {snapshot['checked_at']} · Seasons: {snapshot['start_season']}–{snapshot['end_season']}")
-    market_snapshot = store.latest_market_snapshot()
-    if market_snapshot:
-        st.caption(f"Market source: {market_snapshot['source']} · Retrieved: {market_snapshot['retrieved_at']} · Lines are a median consensus across saved sportsbooks.")
-    elif view == "Games":
+    if not market_snapshot and view == "Games":
         st.info("No current market lines saved. Add AGAINSTALLODDS_ODDS_API_KEY to .env and choose Refresh market odds, or import a reviewed CSV below.")
     if view == "Model comparison":
         from againstallodds.research_ui import comparison_view
@@ -124,7 +313,7 @@ def main():
             st.caption(f"Stored check windows: {len(checks)}. The Windows runner remains inactive until enabled here or with enable-windows-market-checks.")
         return
     if view == "Availability":
-        from againstallodds.injuries import AvailabilityStore, build_qb_profiles, build_wr_profiles, build_rb_te_profiles, build_edge_profiles, sync_injuries, injury_adjusted_predictions, plan_injury_checks, current_report, report_freshness
+        from againstallodds.injuries import AvailabilityStore, build_qb_profiles, build_wr_profiles, build_rb_te_profiles, build_edge_profiles, sync_injuries, refresh_all_availability_data, capture_all_availability_forecasts, injury_adjusted_predictions, plan_injury_checks, current_report, report_freshness
         from againstallodds.experiments import predict_models
         availability = AvailabilityStore(store)
         st.subheader("Quarterback availability")
@@ -195,6 +384,36 @@ def main():
             st.dataframe(pd.DataFrame(records), hide_index=True, width="stretch")
         else:
             st.info("Sync the official injury report before calculating an availability adjustment.")
+        model = st.selectbox("Base projection model", ["power-rating-v1", "ridge-v1", "boosted-v1"], key="availability-model")
+        update_all, capture, calculate = st.columns(3)
+        if update_all.button("Update all availability data", width="stretch"):
+            with st.status("Updating official availability data and player profiles…", expanded=True) as status:
+                outcomes = refresh_all_availability_data(store)
+                for outcome in outcomes:
+                    message = f"{outcome['step']}: {outcome['detail']}"
+                    (st.write if outcome["success"] else st.error)(message)
+                completed = sum(outcome["success"] for outcome in outcomes)
+                status.update(label=f"Updated {completed} of {len(outcomes)} availability steps.", state="complete" if completed == len(outcomes) else "error")
+        if capture.button("Save current all-model forecasts", type="primary", width="stretch"):
+            with st.status("Saving the current pre-kickoff forecast record…", expanded=True) as status:
+                try:
+                    captured = capture_all_availability_forecasts(store)
+                    saved_models = sorted({row["model_id"] for row in captured["available_rows"]})
+                    st.write(f"Saved {len(captured['available_rows'])} base forecast(s) for: {', '.join(saved_models) or 'none'}.")
+                    st.write(f"Saved {len(captured['adjusted_rows'])} availability-adjusted forecast(s).")
+                    for row in captured["unavailable_rows"]:
+                        st.warning(f"{row['model_id']}: {row.get('exclusion', 'forecast unavailable')}")
+                    status.update(label="Saved current pre-kickoff forecast record.", state="complete")
+                except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
+                    status.update(label="Forecast capture failed.", state="error")
+                    st.error(f"Forecast capture failed: {error}")
+        if calculate.button("Calculate upcoming availability-adjusted forecasts", type="primary", width="stretch", disabled=not profile):
+            try:
+                rows = injury_adjusted_predictions(store, predict_models(store, model=model))
+                shown = [{"game_id": r["game_id"], "away": r["away_team"], "home": r["home_team"], "base_margin": r["predicted_margin"], "adjusted_margin": r["injury_adjusted_margin"], "home_expected_QB": r["availability_assessments"][0]["expected_qb_name"], "home_skill_adjustment": r["skill_adjustments"][0], "home_EDGE_adjustment": r["edge_assessments"][0]["adjustment"], "home_reason": r["availability_assessments"][0]["reason"], "away_expected_QB": r["availability_assessments"][1]["expected_qb_name"], "away_skill_adjustment": r["skill_adjustments"][1], "away_EDGE_adjustment": r["edge_assessments"][1]["adjustment"], "away_reason": r["availability_assessments"][1]["reason"]} for r in rows if r.get("predicted_margin") is not None]
+                st.dataframe(pd.DataFrame(shown), hide_index=True, width="stretch")
+            except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
+                st.error(f"Availability forecast failed: {error}")
         if profile:
             profiles = json.loads(profile["profiles"])
             upcoming_games = [game for game in store.games() if not game.complete]
@@ -233,14 +452,6 @@ def main():
                 st.subheader("EDGE disruption inputs")
                 st.caption("EDGE adjustments use sacks plus QB hits from play-by-play. DE, OLB, and EDGE report labels are matched; role-based effects are capped at 2.5 points per team.")
                 st.dataframe(pd.DataFrame(json.loads(edge_profile["profiles"])), hide_index=True, width="stretch")
-            model = st.selectbox("Base projection model", ["power-rating-v1", "ridge-v1", "boosted-v1"], key="availability-model")
-            if st.button("Calculate upcoming availability-adjusted forecasts", type="primary"):
-                try:
-                    rows = injury_adjusted_predictions(store, predict_models(store, model=model))
-                    shown = [{"game_id": r["game_id"], "away": r["away_team"], "home": r["home_team"], "base_margin": r["predicted_margin"], "adjusted_margin": r["injury_adjusted_margin"], "home_expected_QB": r["availability_assessments"][0]["expected_qb_name"], "home_skill_adjustment": r["skill_adjustments"][0], "home_EDGE_adjustment": r["edge_assessments"][0]["adjustment"], "home_reason": r["availability_assessments"][0]["reason"], "away_expected_QB": r["availability_assessments"][1]["expected_qb_name"], "away_skill_adjustment": r["skill_adjustments"][1], "away_EDGE_adjustment": r["edge_assessments"][1]["adjustment"], "away_reason": r["availability_assessments"][1]["reason"]} for r in rows if r.get("predicted_margin") is not None]
-                    st.dataframe(pd.DataFrame(shown), hide_index=True, width="stretch")
-                except (AgainstAllOddsError, OSError, sqlite3.Error) as error:
-                    st.error(f"Availability forecast failed: {error}")
         st.caption("Status weights: Out/Inactive 100%, Doubtful 80%, Questionable or DNP 50%, Limited 25%, Full 0%. A manual expected-QB override is available from the command line and retained with its reason.")
         return
     result = backtest(store)

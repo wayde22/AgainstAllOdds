@@ -182,9 +182,15 @@ def main(argv: list[str] | None = None) -> int:
                 availability.override(args.game_id, team, None, args.player, args.reason, utcnow())
                 result = {"game_id": args.game_id, "team": team, "expected_qb": args.player, "saved": True}
             elif args.command == "predict-with-availability":
-                from againstallodds.experiments import predict_models
-                from againstallodds.injuries import injury_adjusted_predictions
-                result = injury_adjusted_predictions(analytics_store, predict_models(analytics_store, save=True, model=args.model))
+                from againstallodds.injuries import capture_all_availability_forecasts, injury_adjusted_predictions
+                if args.model == "all":
+                    result = capture_all_availability_forecasts(analytics_store)
+                else:
+                    from againstallodds.experiments import predict_models
+                    from againstallodds.nfl_data import utcnow
+                    now = utcnow()
+                    rows = predict_models(analytics_store, now=now, save=True, model=args.model, capture_id=now.isoformat())
+                    result = injury_adjusted_predictions(analytics_store, [row for row in rows if row.get("available") and row.get("predicted_margin") is not None])
             elif args.command == "sync-stats":
                 from againstallodds.nfl_stats import sync_stats
                 result = sync_stats(analytics_store, args.start_season, args.end_season, refresh_history=args.refresh_history, progress=lambda message: print(message, file=sys.stderr, flush=True))
@@ -219,11 +225,13 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 if not analytics_store.latest():
                     raise AgainstAllOddsError("Import NFL data first with sync-nfl.")
+                from againstallodds.nfl_data import utcnow
+                now = utcnow()
                 if args.model == "power-rating-v1":
-                    result = upcoming(analytics_store, save=True)
+                    result = upcoming(analytics_store, now=now, save=True, capture_id=now.isoformat())
                 else:
                     from againstallodds.experiments import predict_models
-                    result = predict_models(analytics_store, save=True, model=args.model, family=args.family)
+                    result = predict_models(analytics_store, now=now, save=True, model=args.model, family=args.family, capture_id=now.isoformat())
             print(json.dumps(result, indent=2))
             return 0
         if args.command == "initialize":

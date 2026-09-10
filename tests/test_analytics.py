@@ -6,6 +6,7 @@ import json
 import sqlite3
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -45,6 +46,37 @@ def test_normalization_and_timezone():
     assert games[0].neutral_site
     assert games[2].kickoff == "2026-09-11T00:20:00+00:00"
     assert not games[2].complete
+
+
+@pytest.mark.parametrize(
+    ("age", "tone", "label"),
+    [
+        (None, "unavailable", "Unavailable"),
+        (timedelta(hours=1, minutes=59), "fresh", "Fresh"),
+        (timedelta(hours=2), "aging", "Aging"),
+        (timedelta(hours=5, minutes=59), "aging", "Aging"),
+        (timedelta(hours=6), "stale", "Stale"),
+    ],
+)
+def test_freshness_status_boundaries(age, tone, label):
+    from againstallodds.dashboard import freshness_status
+
+    timestamp = None if age is None else (NOW - age).isoformat()
+    assert freshness_status(timestamp, now=NOW) == {"tone": tone, "label": label}
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "expected"),
+    [
+        ("2026-09-09T22:18:39.428563+00:00", "9-9-2026 5:18:39 PM CDT"),
+        ("2026-01-09T22:18:39.428563+00:00", "1-9-2026 4:18:39 PM CST"),
+        (None, None),
+    ],
+)
+def test_dashboard_timestamp_format(timestamp, expected):
+    from againstallodds.dashboard import format_dashboard_timestamp
+
+    assert format_dashboard_timestamp(timestamp) == expected
 
 
 @pytest.mark.parametrize("changes", [{"home_team": "???"}, {"home_team": "CHI"}, {"home_score": -1}, {"home_score": ""}, {"spread_line": "nan"}, {"location": "unknown"}, {"week": 0}, {"gameday": "invalid"}, {"game_id": "2016_01_DET_CHI"}])
@@ -146,6 +178,16 @@ def test_forward_saves_are_immutable_and_no_backfilling(tmp_path):
     assert forward_results(fresh, after) == []
 
 
+def test_explicit_forecast_captures_are_separate_immutable_records(tmp_path):
+    store = seeded(tmp_path)
+    first = len(store.predictions())
+    later = NOW + timedelta(minutes=15)
+    upcoming(store, later, save=True, capture_id=later.isoformat())
+    assert len(store.predictions()) == first + 1
+    newest = store.predictions()[-1]
+    assert json.loads(newest["config"])["capture_id"] == later.isoformat()
+
+
 def test_latest_prediction_and_postponement(tmp_path):
     store = seeded(tmp_path)
     sync_nfl(store, fetch=lambda: csv_data((0, {"home_score": 40})), now=NOW + timedelta(hours=1))
@@ -175,16 +217,34 @@ def test_dashboard_views_and_filters(tmp_path, monkeypatch):
     app.session_state[f"initial_refresh:{store.path.resolve()}"] = True
     app.run()
     assert not app.exception
+    assert {button.label for button in app.sidebar.button} >= {
+        "Games", "Teams", "Performance", "Model comparison", "Market quality",
+        "Availability", "Help & guide", "Refresh data", "Refresh market odds",
+    }
     next(s for s in app.selectbox if s.label == "Season").select(2015).run()
     assert not app.exception
-    app.sidebar.radio[0].set_value("Teams").run()
+    next(button for button in app.sidebar.button if button.label == "Teams").click().run()
     assert not app.exception
-    app.sidebar.radio[0].set_value("Performance").run()
+    next(button for button in app.sidebar.button if button.label == "Availability").click().run()
+    assert not app.exception
+    assert any(button.label == "Save current all-model forecasts" for button in app.button)
+    next(button for button in app.sidebar.button if button.label == "Performance").click().run()
     assert not app.exception
     next(r for r in app.radio if r.label == "Evaluation").set_value("Saved forward predictions").run()
     assert not app.exception
-    app.sidebar.radio[0].set_value("Market quality").run()
+    next(button for button in app.sidebar.button if button.label == "Market quality").click().run()
     assert not app.exception
+    next(button for button in app.sidebar.button if button.label == "Availability").click().run()
+    assert not app.exception
+    assert any(button.label == "Update all availability data" for button in app.button)
+    next(button for button in app.sidebar.button if button.label == "Help & guide").click().run()
+    assert not app.exception
+    labels = {item.label for item in app.expander}
+    assert {"Start here · game-day workflow", "Data freshness lights", "Market quality", "Availability"} <= labels
+    from againstallodds import help_view
+    help_text = Path(help_view.__file__).read_text(encoding="utf-8")
+    for label in ("Help & guide", "Update all availability data", "Save current all-model forecasts", "Calculate upcoming availability-adjusted forecasts"):
+        assert label in help_text
 
 
 def test_dashboard_empty_and_offline_refresh(tmp_path, monkeypatch):
@@ -197,8 +257,10 @@ def test_dashboard_empty_and_offline_refresh(tmp_path, monkeypatch):
     app = AppTest.from_file(dashboard.__file__, default_timeout=30).run()
     assert not app.exception
     assert app.error
+    assert any("NFL data · Unavailable" in item.value for item in app.markdown)
+    assert any("Market data · Unavailable" in item.value for item in app.markdown)
     seeded(tmp_path)
-    app.button[0].click().run()
+    next(button for button in app.sidebar.button if button.label == "Refresh data").click().run()
     assert not app.exception
     assert app.warning
     assert app.dataframe

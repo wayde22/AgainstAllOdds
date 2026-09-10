@@ -167,9 +167,9 @@ def compare_models(store, *, family="raw", progress=None, now=None):
     return result
 
 
-def predict_models(store, *, now=None, save=False, model="all", family="raw"):
+def predict_models(store, *, now=None, save=False, model="all", family="raw", capture_id=None):
     now = now or utcnow()
-    forecasts = upcoming(store, now, save=save and model in {"all", BASELINE})
+    forecasts = upcoming(store, now, save=save and model in {"all", BASELINE}, capture_id=capture_id)
     baseline_rows = [{**r, "model_id": BASELINE, "available": True} for r in forecasts]
     if model == BASELINE:
         return baseline_rows
@@ -208,5 +208,7 @@ def predict_models(store, *, now=None, save=False, model="all", family="raw"):
                 saved.append(prediction)
             if save:
                 config = {"model": model_id, "artifact_id": artifact["id"], "feature_version": FEATURE_VERSION, "manifest": manifest}
+                if capture_id:
+                    config["capture_id"] = capture_id
                 store.save_predictions(manifest["schedule"], config, saved, now)
     return output

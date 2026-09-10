@@ -88,7 +88,7 @@ def backtest(store, now=None):
     return result
 
 
-def upcoming(store, now=None, save=False):
+def upcoming(store, now=None, save=False, capture_id=None):
     now = now or nfl_data.utcnow()
     snapshot = store.latest()
     if not snapshot:
@@ -112,7 +112,10 @@ def upcoming(store, now=None, save=False):
         rows.append({**g.to_dict(), "predicted_margin": margin, "market_margin": market_margin, "edge": None if market_margin is None else round(margin - market_margin, 2), **line, **venue, **weather})
     rows = market_quality(store, rows)
     if save:
-        store.save_predictions(snapshot["id"], {**CONFIG, "start": snapshot["start_season"], "end": snapshot["end_season"], "before": today, "market_snapshot_id": market_snapshot and market_snapshot["id"]}, rows, now)
+        config = {**CONFIG, "start": snapshot["start_season"], "end": snapshot["end_season"], "before": today, "market_snapshot_id": market_snapshot and market_snapshot["id"]}
+        if capture_id:
+            config["capture_id"] = capture_id
+        store.save_predictions(snapshot["id"], config, rows, now)
     return rows
 
 
